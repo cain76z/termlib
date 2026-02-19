@@ -10,6 +10,8 @@
 #include <filesystem>
 #include <stdexcept>
 #include <algorithm>
+#include <set>
+#include <cctype>
 
 #include "util.hpp"
 #include "fnutil.hpp"
@@ -29,6 +31,10 @@ struct ArgsParseOptions {
     // 확장자 필터 (소문자로 변환되어 비교됨, 점 포함 예: L".cpp")
     std::vector<std::wstring> include_extensions;  // 이 확장자만 포함 (비어있으면 모두 포함)
     std::vector<std::wstring> exclude_extensions;  // 이 확장자는 제외
+
+    // 값을 가지는 옵션 목록 (예: --output, --threads)
+    // 비어있으면 휴리스틱으로 판단: 다음 인자가 옵션이 아니면 값으로 간주
+    std::set<std::wstring> value_args;
 };
 
 class Args {
@@ -36,7 +42,7 @@ public:
     using path = std::filesystem::path;
     using ParseOptions = ArgsParseOptions;  // 하위 호환성을 위한 별칭
 
-    Args(int argc, char* argv[], ParseOptions opts = {})
+    Args(int argc, char* argv[], ArgsParseOptions opts = {})
         : parse_opts(opts)
     {
         parse_raw_args(argc, argv);
@@ -286,9 +292,6 @@ private:
         // 대부분의 현대 Linux는 UTF-8을 사용하지만, 
         // 다른 인코딩도 지원하기 위해 로케일 기반 변환 사용
         
-        // 현재 콘솔 코드페이지 감지
-        auto current_cp = util::get_console_codepage();
-        
         // 시스템 로케일 설정 (인코딩 변환에 필요)
         std::setlocale(LC_ALL, "");
         
@@ -323,6 +326,15 @@ private:
             if (arg.empty())
                 continue;
 
+            // -- 는 옵션 종료 마커
+            if (arg == L"--") {
+                // 이후 모든 인자는 파일로 취급
+                for (size_t j = i + 1; j < raw_args.size(); ++j) {
+                    file_args.emplace_back(raw_args[j]);
+                }
+                break;
+            }
+
             // -- 또는 - 로 시작하는 옵션
             if (arg[0] == L'-') {
                 // --option=value 형식 파싱
@@ -334,8 +346,23 @@ private:
                     continue;
                 }
 
-                // 다음 인자가 값인지 확인
-                if (i + 1 < raw_args.size() && 
+                // 이 옵션이 값을 가지는지 판단
+                bool takes_value = false;
+
+                if (parse_opts.value_args.empty()) {
+                    // value_args가 비어있으면 휴리스틱 사용:
+                    // 다음 인자가 존재하고 옵션이 아니면 값으로 간주
+                    takes_value = (i + 1 < raw_args.size() && 
+                                  !raw_args[i + 1].empty() &&
+                                  raw_args[i + 1][0] != L'-');
+                } else {
+                    // value_args에 명시적으로 지정된 경우만 값을 가짐
+                    takes_value = (parse_opts.value_args.count(arg) > 0);
+                }
+
+                // 값을 가지는 옵션이고, 다음 인자가 유효하면
+                if (takes_value && 
+                    i + 1 < raw_args.size() && 
                     !raw_args[i + 1].empty() &&
                     raw_args[i + 1][0] != L'-') 
                 {
@@ -466,15 +493,17 @@ private:
         if (has_wildcard) {
             auto matches = fnutil::glob_ex(p, glob_opt);
             
-            for (const auto& match : matches) {
-                // glob_ex가 실패하면 원본을 반환하는데,
-                // 원본이 와일드카드를 포함하면 실제 파일이 아니므로 검증
-                if (match == p && has_wildcard) {
-                    // 매칭 실패 - 원본이 와일드카드면 스킵
-                    if (parse_opts.verify_exists)
-                        continue;
-                }
+            // glob_ex가 실패하면 원본을 반환하는데,
+            // 원본이 와일드카드를 포함하면 실제 파일이 아니므로 검증
+            if (matches.size() == 1 && matches[0] == p) {
+                // 매칭 실패 - 원본이 와일드카드면 스킵
+                if (parse_opts.verify_exists)
+                    return;  // 존재하지 않으므로 무시
+                // verify_exists가 false여도 와일드카드 패턴 자체는 파일이 아니므로 무시
+                return;
+            }
 
+            for (const auto& match : matches) {
                 add_file_if_valid(match, expanded, seen);
             }
         }
@@ -528,6 +557,12 @@ private:
             try {
                 // 절대 경로로 정규화하여 중복 체크
                 canonical_path = std::filesystem::absolute(p).wstring();
+                
+                // Windows: 대소문자 무시 비교를 위해 소문자 변환
+                // Linux: 대소문자 구분이 중요하므로 원본 유지
+#ifdef _WIN32
+                canonical_path = util::to_lower_ascii(canonical_path);
+#endif
             }
             catch (...) {
                 // 정규화 실패 시 원본 경로 사용

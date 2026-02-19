@@ -40,7 +40,7 @@ inline bool has(flag f, flag v) {
  * ========================================================= */
 inline char normChar(char c, bool ignoreCase) {
     return ignoreCase
-        ? std::tolower(static_cast<unsigned char>(c))
+        ? static_cast<char>(std::tolower(static_cast<unsigned char>(c)))
         : c;
 }
 
@@ -55,25 +55,31 @@ inline bool naturalLess(
     size_t ia = 0, ib = 0;
 
     while (ia < a.size() && ib < b.size()) {
-        if (std::isdigit((unsigned char)a[ia]) &&
-            std::isdigit((unsigned char)b[ib])) {
+        if (std::isdigit(static_cast<unsigned char>(a[ia])) &&
+            std::isdigit(static_cast<unsigned char>(b[ib]))) {
 
             size_t ja = ia, jb = ib;
 
-            while (ja < a.size() && std::isdigit((unsigned char)a[ja])) ++ja;
-            while (jb < b.size() && std::isdigit((unsigned char)b[jb])) ++jb;
-            // Improved numeric parsing with error handling
+            while (ja < a.size() && std::isdigit(static_cast<unsigned char>(a[ja]))) ++ja;
+            while (jb < b.size() && std::isdigit(static_cast<unsigned char>(b[jb]))) ++jb;
+
             try {
+                // stoll은 예외를 던질 수 있으므로 try-catch 유지
                 long long na = std::stoll(a.substr(ia, ja - ia));
                 long long nb = std::stoll(b.substr(ib, jb - ib));
-                if (na != nb) return na < nb;
-            } catch (const std::exception&) {
-                // Fall back to lexicographic comparison
-                return a.substr(ia, ja - ia) < b.substr(ib, jb - ib);
-            }
 
-            if ((ja - ia) != (jb - ib))
-                return (ja - ia) < (jb - ib);
+                if (na != nb) return na < nb;
+
+                // [수정] 숫자 값은 같지만 자릿수가 다른 경우 처리 (예: "02" < "2")
+                if ((ja - ia) != (jb - ib))
+                    return (ja - ia) < (jb - ib);
+
+            } catch (const std::exception&) {
+                // 변환 실패 시 사전순 비교로 폴백
+                auto sa = a.substr(ia, ja - ia);
+                auto sb = b.substr(ib, jb - ib);
+                if (sa != sb) return sa < sb;
+            }
 
             ia = ja;
             ib = jb;
@@ -108,8 +114,11 @@ inline bool pathLess(const fs::path& a,
             auto sb = ib->string();
 
             if (sa == sb) continue;
+            
+            // naturalLess 결과에 따라 비교 반환
             return naturalLess(sa, sb, ic);
         }
+        // 경로 구성 요소 개수 비교 (예: /a vs /a/b)
         return std::distance(a.begin(), a.end()) <
                std::distance(b.begin(), b.end());
     }
@@ -142,21 +151,32 @@ inline void sort(It first, It last, flag flags = flag::none) {
 }
 
 /* =========================================================
- *  wildcard → regex
+ *  wildcard → regex (개선됨)
  * ========================================================= */
-inline std::regex wildcardToRegex(const std::string& pattern,
-                                  bool ignoreCase) {
+inline std::string wildcardToRegexString(const std::string& pattern) {
     std::string rx;
     rx.reserve(pattern.size() * 2);
 
     for (char c : pattern) {
         switch (c) {
         case '*': rx += ".*"; break;
-        case '?': rx += "."; break;
-        case '.': rx += "\\."; break;
+        case '?': rx += ".";  break;
+        // 정규식 메타 문자 이스케이프 처리
+        case '.': case '^': case '$': case '+':
+        case '(': case ')': case '[': case ']':
+        case '{': case '}': case '|': case '\\':
+            rx += '\\';
+            rx += c;
+            break;
         default:  rx += c; break;
         }
     }
+    return rx;
+}
+
+inline std::regex wildcardToRegex(const std::string& pattern,
+                                  bool ignoreCase) {
+    std::string rx = wildcardToRegexString(pattern);
 
     return std::regex(
         rx,
@@ -175,78 +195,48 @@ inline std::vector<fs::path> glob(
 ) {
     std::vector<fs::path> result;
 
-    if (!fs::is_directory(directory))
-        return result;
+    try {
+        if (!fs::is_directory(directory))
+            return result;
 
-    const auto regex = wildcardToRegex(pattern, ignoreCase);
+        const auto regex = wildcardToRegex(pattern, ignoreCase);
 
-    if (recursive) {
-        for (const auto& e :
-             fs::recursive_directory_iterator(
-                 directory,
-                 fs::directory_options::skip_permission_denied)) {
-
-            if (!e.is_regular_file()) continue;
-
+        auto process_entry = [&](const fs::directory_entry& e) {
+            if (!e.is_regular_file()) return;
             const auto name = e.path().filename().string();
             if (std::regex_match(name, regex)) {
                 result.push_back(e.path());
             }
-        }
-    }
-    else {
-        for (const auto& e :
-             fs::directory_iterator(
-                 directory,
-                 fs::directory_options::skip_permission_denied)) {
+        };
 
-            if (!e.is_regular_file()) continue;
-
-            const auto name = e.path().filename().string();
-            if (std::regex_match(name, regex)) {
-                result.push_back(e.path());
+        if (recursive) {
+            for (const auto& e : fs::recursive_directory_iterator(
+                    directory, fs::directory_options::skip_permission_denied)) {
+                process_entry(e);
             }
         }
+        else {
+            for (const auto& e : fs::directory_iterator(
+                    directory, fs::directory_options::skip_permission_denied)) {
+                process_entry(e);
+            }
+        }
+    } catch (const fs::filesystem_error&) {
+        // 권한 등의 문제로 디렉토리 순회 실패 시 조용히 무시
     }
 
     return result;
 }
+
 /* =========================================================
  *  glob_ex (확장 와일드카드)
  * ========================================================= */
-
 struct glob_options {
     bool include_directories = false;
     bool recursive = false;
     bool ignoreCase = true;
     bool absolute = true;
 };
-
-inline std::string wildcardToRegexEx(const std::string& wc) {
-    std::string re = "^";
-    re.reserve(wc.size() * 2);
-
-    for (char c : wc) {
-        switch (c) {
-        case '*': re += ".*"; break;
-        case '?': re += ".";  break;
-
-        case '.': case '^': case '$': case '+':
-        case '(': case ')': case '[': case ']':
-        case '{': case '}': case '|': case '\\':
-            re += '\\';
-            re += c;
-            break;
-
-        default:
-            re += c;
-            break;
-        }
-    }
-
-    re += "$";
-    return re;
-}
 
 inline std::vector<fs::path> glob_ex(
     const fs::path& input,
@@ -262,81 +252,61 @@ inline std::vector<fs::path> glob_ex(
     if (pattern.empty())
         pattern = "*";
 
+    // 공통 함수 사용
     std::regex::flag_type flags = std::regex::ECMAScript;
     if (opt.ignoreCase)
         flags |= std::regex::icase;
 
-    const std::regex re(
-        wildcardToRegexEx(pattern),
-        flags
-    );
+    const std::regex re(wildcardToRegexString(pattern), flags);
 
     try {
         if (!fs::exists(dir) || !fs::is_directory(dir))
-            return matches;
+            return matches; // 디렉토리 없으면 빈 벡터 반환
+
+        auto process_entry = [&](const fs::directory_entry& e) {
+            if (!opt.include_directories && !e.is_regular_file())
+                return;
+
+            const auto name = e.path().filename().string();
+            if (std::regex_match(name, re)) {
+                matches.push_back(opt.absolute ? fs::absolute(e.path()) : e.path());
+            }
+        };
 
         if (opt.recursive) {
-            for (const auto& e :
-                 fs::recursive_directory_iterator(
-                     dir,
-                     fs::directory_options::skip_permission_denied)) {
-
-                if (!opt.include_directories &&
-                    !e.is_regular_file())
-                    continue;
-
-                const auto name =
-                    e.path().filename().string();
-
-                if (std::regex_match(name, re)) {
-                    matches.push_back(
-                        opt.absolute
-                        ? fs::absolute(e.path())
-                        : e.path());
-                }
+            for (const auto& e : fs::recursive_directory_iterator(
+                    dir, fs::directory_options::skip_permission_denied)) {
+                process_entry(e);
             }
         } else {
-            for (const auto& e :
-                 fs::directory_iterator(
-                     dir,
-                     fs::directory_options::skip_permission_denied)) {
-
-                if (!opt.include_directories &&
-                    !e.is_regular_file())
-                    continue;
-
-                const auto name =
-                    e.path().filename().string();
-
-                if (std::regex_match(name, re)) {
-                    matches.push_back(
-                        opt.absolute
-                        ? fs::absolute(e.path())
-                        : e.path());
-                }
+            for (const auto& e : fs::directory_iterator(
+                    dir, fs::directory_options::skip_permission_denied)) {
+                process_entry(e);
             }
         }
     }
     catch (const fs::filesystem_error&) {
-        // fnutil 스타일: 조용히 무시
+        // 무시
     }
 
-    // 매칭 실패 시 원본 유지 (CLI 관례)
-    if (matches.empty()) {
-        matches.push_back(input);
-    }
-    else {
+    // [정책 변경 제안] 매칭 실패 시 원본 유지 대신 빈 벡터 반환 고려
+    // 여기서는 기존 코드의 의도를 존중하되, 정렬은 결과가 있을 때만 수행
+    if (!matches.empty()) {
         fnutil::sort(
             matches.begin(),
             matches.end(),
             flag::naturalPath | flag::ignoreCase);
+    } else {
+        // 기존 코드: matches.push_back(input);
+        // 필요하다면 원본 유지 로직을 여기에 둡니다.
+        matches.push_back(input);
     }
 
     return matches;
 }
 
 /* =========================================================
- *  path split
+ *  path split / join
  * ========================================================= */
 struct path_parts {
     fs::path drive;
@@ -354,9 +324,6 @@ inline path_parts split(const fs::path& p) {
     };
 }
 
-/* =========================================================
- *  path join
- * ========================================================= */
 inline fs::path join(const std::vector<fs::path>& parts) {
     fs::path out;
     for (const auto& p : parts)

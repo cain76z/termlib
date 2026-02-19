@@ -93,6 +93,10 @@ namespace ansi {
     inline std::string clear_line() { return "\033[2K"; }
     inline std::string hide_cursor() { return "\033[?25l"; }
     inline std::string show_cursor() { return "\033[?25h"; }
+    
+    // 커서 저장 및 복구 (DEC Private Mode)
+    inline std::string save_cursor() { return "\033[s"; }    // 저장
+    inline std::string restore_cursor() { return "\033[u"; } // 복구
 
     // 스타일 함수들 (네임스페이스 레벨)
     inline std::string style(const std::string& name_raw) {
@@ -112,7 +116,7 @@ namespace ansi {
         return "";
     }
 
-    // 개별 스타일 상수 (직접 사용 가능)
+    // 개별 스타일 상수
     namespace style_code {
         constexpr const char* bold      = "\033[1m";
         constexpr const char* faint     = "\033[2m";
@@ -167,7 +171,6 @@ namespace ansi {
         // #hex 형식
         if (!spec.empty() && spec[0] == '#') {
             std::string hex = spec.substr(1);
-            // #RGB -> #RRGGBB 확장
             if (hex.size() == 3) {
                 hex = {hex[0],hex[0],hex[1],hex[1],hex[2],hex[2]};
             }
@@ -192,7 +195,6 @@ namespace ansi {
             std::string token;
             
             while (std::getline(ss, token, ',')) {
-                // trim token
                 token.erase(0, token.find_first_not_of(" \t"));
                 token.erase(token.find_last_not_of(" \t") + 1);
                 if (!token.empty()) {
@@ -253,7 +255,6 @@ namespace ansi {
 
     // 버퍼 시스템
     namespace detail {
-        // 스레드 로컬 버퍼 (멀티스레드 안전성)
         inline std::string& buffer() { 
             thread_local std::string b; 
             return b; 
@@ -288,6 +289,7 @@ namespace ansi {
 
         buffer_proxy& fg(const std::string& spec) {
             auto code = get_color_code(spec, true);
+            // 현재 상태와 다를 때만 코드 추가 (최적화)
             if (code && code != detail::cur_fg()) {
                 detail::buffer() += "\033[" + *code + "m";
                 detail::cur_fg() = code;
@@ -336,6 +338,7 @@ namespace ansi {
             
             auto it = styles.find(name);
             if (it != styles.end()) {
+                // 이미 적용된 스타일이 아니면 추가
                 if (detail::cur_styles().insert(it->second).second) {
                     detail::buffer() += "\033[" + std::to_string(it->second) + "m";
                 }
@@ -356,7 +359,7 @@ namespace ansi {
             return *this;
         }
 
-        // 개선된 strip() - ANSI 이스케이프 시퀀스 제거
+        // 개선된 strip() - CSI 시퀀스 범용 처리
         buffer_proxy& strip() {
             std::string& buf = detail::buffer();
             std::string clean;
@@ -366,14 +369,13 @@ namespace ansi {
             while (i < buf.size()) {
                 if (buf[i] == '\033' && i + 1 < buf.size() && buf[i + 1] == '[') {
                     size_t j = i + 2;
-                    // CSI 시퀀스 파싱
+                    // CSI 시퀀스 파싱: Parameter bytes (0x30-0x3F) + Intermediate bytes (0x20-0x2F)
                     while (j < buf.size() && 
-                           (std::isdigit(static_cast<unsigned char>(buf[j])) || 
-                            buf[j] == ';' || buf[j] == '?')) {
+                           (buf[j] >= 0x20 && buf[j] <= 0x3F)) {
                         ++j;
                     }
-                    // 종료 문자 확인 (m, H, A-D, J, K 등)
-                    if (j < buf.size() && std::isalpha(static_cast<unsigned char>(buf[j]))) {
+                    // Final byte (0x40-0x7E)
+                    if (j < buf.size() && (buf[j] >= 0x40 && buf[j] <= 0x7E)) {
                         i = j + 1;
                         continue;
                     }
@@ -389,18 +391,19 @@ namespace ansi {
             std::cout << detail::buffer();
             std::cout.flush();
             detail::buffer().clear();
-            detail::cur_fg().reset();
-            detail::cur_bg().reset();
-            detail::cur_styles().clear();
+            
+            // [수정] 상태를 초기화하지 않음.
+            // flush는 단순히 버퍼를 비우는 것이며, 터미널의 상태(색상 등)는 유지됨.
+            // 라이브러리의 추적 상태도 터미널 상태와 동기화하기 위해 유지해야 함.
+            // reset()을 명시적으로 호출할 때만 상태를 초기화함.
+            
             return *this;
         }
         
-        // 버퍼 내용 반환 (출력하지 않고)
         std::string str() const {
             return detail::buffer();
         }
         
-        // 버퍼 초기화
         buffer_proxy& clear() {
             detail::buffer().clear();
             detail::cur_fg().reset();
