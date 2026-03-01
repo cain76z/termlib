@@ -4,12 +4,16 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <filesystem>
 #include <iterator>
 #include <regex>
 #include <string>
+#include <system_error>
 #include <type_traits>
 #include <vector>
+
+#include "encode.hpp"   // util::to_lower_ascii
 
 namespace fnutil {
 
@@ -19,119 +23,104 @@ namespace fs = std::filesystem;
  *  flag (정렬 옵션)
  * ========================================================= */
 enum class flag : unsigned {
-    none         = 0,
-    naturalName = 1 << 0, // 파일명 기준 자연 정렬
-    naturalPath = 1 << 1, // 전체 경로 자연 정렬
-    ignoreCase  = 1 << 2, // 대소문자 무시
+    none        = 0,
+    naturalName = 1 << 0,   ///< 파일명 기준 자연 정렬
+    naturalPath = 1 << 1,   ///< 전체 경로 자연 정렬
+    ignoreCase  = 1 << 2,   ///< 대소문자 무시
 };
 
 inline flag operator|(flag a, flag b) {
-    return static_cast<flag>(
-        static_cast<unsigned>(a) | static_cast<unsigned>(b));
+    return static_cast<flag>(static_cast<unsigned>(a) | static_cast<unsigned>(b));
 }
-
 inline bool has(flag f, flag v) {
-    return (static_cast<unsigned>(f) &
-            static_cast<unsigned>(v)) != 0;
+    return (static_cast<unsigned>(f) & static_cast<unsigned>(v)) != 0;
 }
 
 /* =========================================================
- *  내부 유틸
+ *  naturalLess — 숫자 구간을 수치로 비교하는 자연 정렬
+ *
+ *  [fix 3] stoll + try-catch 제거 → 예외 없는 직접 비교
+ *    1) 선행 0 제거 후 유효 자릿수 비교 (긴 쪽이 큼)
+ *    2) 자릿수 같으면 사전순 비교
+ *
+ *  [fix 4] 선행 0 정책 — Windows Explorer 스타일
+ *    "02"와 "2"는 수치가 동일하므로 동등 처리 (tie-breaker 없음).
  * ========================================================= */
-inline char normChar(char c, bool ignoreCase) {
-    return ignoreCase
-        ? static_cast<char>(std::tolower(static_cast<unsigned char>(c)))
-        : c;
-}
+inline bool naturalLess(const std::string& a,
+                        const std::string& b,
+                        bool ic)
+{
+    auto lower = [ic](char c) -> char {
+        return ic ? static_cast<char>(std::tolower(static_cast<unsigned char>(c))) : c;
+    };
 
-/* =========================================================
- *  문자열 자연 정렬
- * ========================================================= */
-inline bool naturalLess(
-    const std::string& a,
-    const std::string& b,
-    bool ignoreCase
-) {
     size_t ia = 0, ib = 0;
 
     while (ia < a.size() && ib < b.size()) {
         if (std::isdigit(static_cast<unsigned char>(a[ia])) &&
-            std::isdigit(static_cast<unsigned char>(b[ib]))) {
+            std::isdigit(static_cast<unsigned char>(b[ib])))
+        {
+            // 선행 0 건너뜀
+            size_t za = ia, zb = ib;
+            while (za < a.size() && a[za] == '0') ++za;
+            while (zb < b.size() && b[zb] == '0') ++zb;
 
-            size_t ja = ia, jb = ib;
-
+            // 숫자 블록 끝
+            size_t ja = za, jb = zb;
             while (ja < a.size() && std::isdigit(static_cast<unsigned char>(a[ja]))) ++ja;
             while (jb < b.size() && std::isdigit(static_cast<unsigned char>(b[jb]))) ++jb;
 
-            try {
-                // stoll은 예외를 던질 수 있으므로 try-catch 유지
-                long long na = std::stoll(a.substr(ia, ja - ia));
-                long long nb = std::stoll(b.substr(ib, jb - ib));
+            // 유효 자릿수 비교 — 예외 없음, 할당 없음
+            const size_t da = ja - za;
+            const size_t db = jb - zb;
+            if (da != db) return da < db;
 
-                if (na != nb) return na < nb;
-
-                // [수정] 숫자 값은 같지만 자릿수가 다른 경우 처리 (예: "02" < "2")
-                if ((ja - ia) != (jb - ib))
-                    return (ja - ia) < (jb - ib);
-
-            } catch (const std::exception&) {
-                // 변환 실패 시 사전순 비교로 폴백
-                auto sa = a.substr(ia, ja - ia);
-                auto sb = b.substr(ib, jb - ib);
-                if (sa != sb) return sa < sb;
+            // 자릿수 같으면 사전순
+            for (size_t k = 0; k < da; ++k) {
+                if (a[za + k] != b[zb + k])
+                    return a[za + k] < b[zb + k];
             }
-
+            // 수치 동일 → 다음 블록으로
             ia = ja;
             ib = jb;
         }
         else {
-            char ca = normChar(a[ia], ignoreCase);
-            char cb = normChar(b[ib], ignoreCase);
-
+            char ca = lower(a[ia]);
+            char cb = lower(b[ib]);
             if (ca != cb) return ca < cb;
-            ++ia;
-            ++ib;
+            ++ia; ++ib;
         }
     }
 
-    return a.size() < b.size();
+    // 남은 문자 수 비교.
+    // a.size() < b.size() 를 쓰면 "file2"(5) vs "file02"(6) 에서
+    // 숫자 블록을 소비한 뒤 ia=5, ib=6 으로 둘 다 남은 문자가 0개임에도
+    // 5 < 6 = true 를 반환하는 버그가 생김.
+    return (a.size() - ia) < (b.size() - ib);
 }
 
 /* =========================================================
- *  path 비교
+ *  pathLess — fs::path 비교
  * ========================================================= */
-inline bool pathLess(const fs::path& a,
-                     const fs::path& b,
-                     flag flags) {
+inline bool pathLess(const fs::path& a, const fs::path& b, flag flags) {
     const bool ic = has(flags, flag::ignoreCase);
 
     if (has(flags, flag::naturalPath)) {
-        auto ia = a.begin();
-        auto ib = b.begin();
-
+        auto ia = a.begin(), ib = b.begin();
         for (; ia != a.end() && ib != b.end(); ++ia, ++ib) {
-            auto sa = ia->string();
-            auto sb = ib->string();
-
+            auto sa = ia->string(), sb = ib->string();
             if (sa == sb) continue;
-            
-            // naturalLess 결과에 따라 비교 반환
             return naturalLess(sa, sb, ic);
         }
-        // 경로 구성 요소 개수 비교 (예: /a vs /a/b)
         return std::distance(a.begin(), a.end()) <
                std::distance(b.begin(), b.end());
     }
 
-    if (has(flags, flag::naturalName)) {
-        return naturalLess(
-            a.filename().string(),
-            b.filename().string(),
-            ic
-        );
-    }
+    if (has(flags, flag::naturalName))
+        return naturalLess(a.filename().string(), b.filename().string(), ic);
 
-    return a < b;
+    // [fix 5] native() 명시 (operator< 내부 동작과 동일하나 의도 명확)
+    return a.native() < b.native();
 }
 
 /* =========================================================
@@ -140,10 +129,8 @@ inline bool pathLess(const fs::path& a,
 template <typename It>
 inline void sort(It first, It last, flag flags = flag::none) {
     using T = typename std::iterator_traits<It>::value_type;
-
     static_assert(std::is_same_v<T, fs::path>,
-        "fnutil::sort requires std::filesystem::path");
-
+                  "fnutil::sort requires std::filesystem::path");
     std::sort(first, last,
         [flags](const fs::path& a, const fs::path& b) {
             return pathLess(a, b, flags);
@@ -151,191 +138,237 @@ inline void sort(It first, It last, flag flags = flag::none) {
 }
 
 /* =========================================================
- *  wildcard → regex (개선됨)
+ *  wildcard → regex
+ *
+ *  [fix 1] wildcardToRegex: icase는 ECMAScript와 OR 조합 필수
+ *          (표준상 icase 단독은 syntax option이 아닌 플래그)
  * ========================================================= */
 inline std::string wildcardToRegexString(const std::string& pattern) {
     std::string rx;
     rx.reserve(pattern.size() * 2);
-
     for (char c : pattern) {
         switch (c) {
         case '*': rx += ".*"; break;
         case '?': rx += ".";  break;
-        // 정규식 메타 문자 이스케이프 처리
         case '.': case '^': case '$': case '+':
         case '(': case ')': case '[': case ']':
         case '{': case '}': case '|': case '\\':
-            rx += '\\';
-            rx += c;
-            break;
-        default:  rx += c; break;
+            rx += '\\'; rx += c; break;
+        default: rx += c; break;
         }
     }
     return rx;
 }
 
-inline std::regex wildcardToRegex(const std::string& pattern,
-                                  bool ignoreCase) {
-    std::string rx = wildcardToRegexString(pattern);
-
-    return std::regex(
-        rx,
-        ignoreCase ? std::regex::icase : std::regex::ECMAScript
-    );
+inline std::regex wildcardToRegex(const std::string& pattern, bool ignoreCase) {
+    std::regex::flag_type flags = std::regex::ECMAScript;
+    if (ignoreCase) flags |= std::regex::icase;
+    return std::regex(wildcardToRegexString(pattern), flags);
 }
 
 /* =========================================================
- *  디렉토리 + 와일드카드 로드
+ *  glob — 디렉토리 + 패턴 매칭
+ *
+ *  [fix 8] error_code 기반 이터레이터 — 순회 중 예외 방지
  * ========================================================= */
 inline std::vector<fs::path> glob(
     const fs::path& directory,
     const std::string& pattern,
-    bool recursive = false,
-    bool ignoreCase = true
-) {
+    bool recursive  = false,
+    bool ignoreCase = true)
+{
     std::vector<fs::path> result;
 
-    try {
-        if (!fs::is_directory(directory))
-            return result;
+    std::error_code ec;
+    if (!fs::is_directory(directory, ec)) return result;
 
-        const auto regex = wildcardToRegex(pattern, ignoreCase);
+    const auto re = wildcardToRegex(pattern, ignoreCase);
 
-        auto process_entry = [&](const fs::directory_entry& e) {
-            if (!e.is_regular_file()) return;
-            const auto name = e.path().filename().string();
-            if (std::regex_match(name, regex)) {
-                result.push_back(e.path());
-            }
-        };
+    auto process = [&](const fs::directory_entry& e) {
+        std::error_code ec2;
+        if (!e.is_regular_file(ec2)) return;
+        if (std::regex_match(e.path().filename().string(), re))
+            result.push_back(e.path());
+    };
 
-        if (recursive) {
-            for (const auto& e : fs::recursive_directory_iterator(
-                    directory, fs::directory_options::skip_permission_denied)) {
-                process_entry(e);
-            }
+    if (recursive) {
+        fs::recursive_directory_iterator it(
+            directory, fs::directory_options::skip_permission_denied, ec);
+        for (; !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+            if (ec) { ec.clear(); continue; }
+            process(*it);
         }
-        else {
-            for (const auto& e : fs::directory_iterator(
-                    directory, fs::directory_options::skip_permission_denied)) {
-                process_entry(e);
-            }
+    } else {
+        fs::directory_iterator it(
+            directory, fs::directory_options::skip_permission_denied, ec);
+        for (; !ec && it != fs::directory_iterator(); it.increment(ec)) {
+            if (ec) { ec.clear(); continue; }
+            process(*it);
         }
-    } catch (const fs::filesystem_error&) {
-        // 권한 등의 문제로 디렉토리 순회 실패 시 조용히 무시
     }
-
     return result;
 }
 
 /* =========================================================
- *  glob_ex (확장 와일드카드)
+ *  glob_options
  * ========================================================= */
 struct glob_options {
     bool include_directories = false;
-    bool recursive = false;
-    bool ignoreCase = true;
-    bool absolute = true;
+    bool recursive           = false;
+    bool ignoreCase          = true;
+    bool absolute            = true;
+    /// [fix 2] 미매칭 시 원본을 결과에 포함할지 여부
+    /// false(기본): 매칭 없으면 빈 벡터 — 호출자가 존재하지 않는 파일을 오인하지 않음
+    /// true: 이전 동작 유지 (shell globbing 모방 목적으로 명시적 선택)
+    bool keep_unmatched      = false;
 };
 
+/* =========================================================
+ *  glob_ex — 경로+와일드카드 통합 처리
+ *
+ *  [fix 2] 미매칭 기본: 빈 벡터 반환
+ *  [fix 8] error_code 기반 이터레이터
+ * ========================================================= */
 inline std::vector<fs::path> glob_ex(
     const fs::path& input,
-    glob_options opt = {}
-) {
+    glob_options opt = {})
+{
     std::vector<fs::path> matches;
 
     fs::path dir = input.parent_path();
-    if (dir.empty())
-        dir = fs::current_path();
+    if (dir.empty()) dir = fs::current_path();
 
     std::string pattern = input.filename().string();
-    if (pattern.empty())
-        pattern = "*";
+    if (pattern.empty()) pattern = "*";
 
-    // 공통 함수 사용
-    std::regex::flag_type flags = std::regex::ECMAScript;
-    if (opt.ignoreCase)
-        flags |= std::regex::icase;
+    std::regex::flag_type rflags = std::regex::ECMAScript;
+    if (opt.ignoreCase) rflags |= std::regex::icase;
+    const std::regex re(wildcardToRegexString(pattern), rflags);
 
-    const std::regex re(wildcardToRegexString(pattern), flags);
+    std::error_code ec;
+    if (!fs::exists(dir, ec) || !fs::is_directory(dir, ec)) return matches;
 
-    try {
-        if (!fs::exists(dir) || !fs::is_directory(dir))
-            return matches; // 디렉토리 없으면 빈 벡터 반환
+    auto process = [&](const fs::directory_entry& e) {
+        std::error_code ec2;
+        if (!opt.include_directories && !e.is_regular_file(ec2)) return;
+        if (std::regex_match(e.path().filename().string(), re))
+            matches.push_back(opt.absolute ? fs::absolute(e.path()) : e.path());
+    };
 
-        auto process_entry = [&](const fs::directory_entry& e) {
-            if (!opt.include_directories && !e.is_regular_file())
-                return;
-
-            const auto name = e.path().filename().string();
-            if (std::regex_match(name, re)) {
-                matches.push_back(opt.absolute ? fs::absolute(e.path()) : e.path());
-            }
-        };
-
-        if (opt.recursive) {
-            for (const auto& e : fs::recursive_directory_iterator(
-                    dir, fs::directory_options::skip_permission_denied)) {
-                process_entry(e);
-            }
-        } else {
-            for (const auto& e : fs::directory_iterator(
-                    dir, fs::directory_options::skip_permission_denied)) {
-                process_entry(e);
-            }
+    if (opt.recursive) {
+        fs::recursive_directory_iterator it(
+            dir, fs::directory_options::skip_permission_denied, ec);
+        for (; !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+            if (ec) { ec.clear(); continue; }
+            process(*it);
+        }
+    } else {
+        fs::directory_iterator it(
+            dir, fs::directory_options::skip_permission_denied, ec);
+        for (; !ec && it != fs::directory_iterator(); it.increment(ec)) {
+            if (ec) { ec.clear(); continue; }
+            process(*it);
         }
     }
-    catch (const fs::filesystem_error&) {
-        // 무시
-    }
 
-    // [정책 변경 제안] 매칭 실패 시 원본 유지 대신 빈 벡터 반환 고려
-    // 여기서는 기존 코드의 의도를 존중하되, 정렬은 결과가 있을 때만 수행
     if (!matches.empty()) {
-        fnutil::sort(
-            matches.begin(),
-            matches.end(),
-            flag::naturalPath | flag::ignoreCase);
-    } else {
-        // 기존 코드: matches.push_back(input);
-        // 필요하다면 원본 유지 로직을 여기에 둡니다.
-        matches.push_back(input);
+        fnutil::sort(matches.begin(), matches.end(),
+                     flag::naturalPath | flag::ignoreCase);
+    } else if (opt.keep_unmatched) {
+        matches.push_back(input);  // 명시적으로 요청한 경우에만
     }
 
     return matches;
 }
 
 /* =========================================================
- *  path split / join
+ *  path_parts / split / join
+ *
+ *  [fix 6] Windows에서 parent_path()가 drive를 포함하므로
+ *  dir은 root_path()를 제거한 상대 부분만 담음
  * ========================================================= */
 struct path_parts {
-    fs::path drive;
-    fs::path dir;
-    fs::path name;
-    fs::path ext;
+    fs::path drive;   ///< Windows: "C:"  / POSIX: ""
+    fs::path dir;     ///< drive를 제외한 부모 디렉토리 (상대 경로)
+    fs::path name;    ///< 확장자 없는 파일명 (stem)
+    fs::path ext;     ///< 확장자 (점 포함, 예: ".png")
 };
 
+/// 경로를 구성 요소로 분해
+/// Windows 예) "C:\dir\sub\file.txt"
+///   drive="C:", dir="dir/sub", name="file", ext=".txt"
+/// POSIX 예) "/dir/sub/file.txt"
+///   drive="",   dir="dir/sub", name="file", ext=".txt"
 inline path_parts split(const fs::path& p) {
-    return {
-        p.root_name(),          // Windows: C:
-        p.parent_path(),        // directory
-        p.stem(),               // filename without ext
-        p.extension()           // .png
-    };
+    const fs::path parent = p.parent_path();
+    // root_path() = root_name() + root_directory() ("C:\" or "/")
+    // relative_path()는 root를 제거한 나머지
+    fs::path dir = parent.relative_path();  // "C:\dir" → "dir"
+
+    return { p.root_name(), dir, p.stem(), p.extension() };
 }
 
 inline fs::path join(const std::vector<fs::path>& parts) {
     fs::path out;
-    for (const auto& p : parts)
-        out /= p;
+    for (const auto& p : parts) out /= p;
     return out;
 }
 
 inline fs::path join(std::initializer_list<fs::path> parts) {
     fs::path out;
-    for (const auto& p : parts)
-        out /= p;
+    for (const auto& p : parts) out /= p;
     return out;
+}
+
+/* =========================================================
+ *  wstring 기반 파일시스템 래퍼
+ * ========================================================= */
+
+/// 파일 확장자 반환 (점 제외, 소문자) — L"image.PNG" → L"png"
+inline std::wstring get_extension(const std::wstring& path, bool lower_case = true, bool with_dot = false) {
+    std::wstring ext = fs::path(path).extension().wstring();
+    if (!ext.empty() && ext[0] == L'.') ext = ext.substr(1);
+    if (lower_case) ext = util::to_lower_ascii(std::move(ext));
+    if (with_dot && !ext.empty()) ext = L"." + ext;
+    return ext;
+}
+
+/// 확장자 없는 파일명 반환 — L"archive.tar.gz" → L"archive.tar"
+inline std::wstring get_stem(const std::wstring& path) {
+    return fs::path(path).stem().wstring();
+}
+
+/// 부모 디렉토리 경로 반환 — L"/a/b/c.txt" → L"/a/b"
+inline std::wstring get_directory(const std::wstring& path) {
+    return fs::path(path).parent_path().wstring();
+}
+
+/// 확장자 교체 — change_extension(L"a/b.txt", L".md") → L"a/b.md"
+inline std::wstring change_extension(const std::wstring& path,
+                                     const std::wstring& ext)
+{
+    fs::path p(path);
+    p.replace_extension(ext);
+    return p.wstring();
+}
+
+/// 파일 존재 여부 (오류 시 false)
+inline bool file_exists(const std::wstring& path) {
+    std::error_code ec;
+    return fs::exists(path, ec) && !ec;
+}
+
+/// 디렉토리 존재 여부 (오류 시 false)
+inline bool directory_exists(const std::wstring& path) {
+    std::error_code ec;
+    return fs::is_directory(path, ec) && !ec;
+}
+
+/// 파일 크기 반환 (실패 시 -1)
+inline std::intmax_t get_file_size(const std::wstring& path) {
+    std::error_code ec;
+    auto sz = fs::file_size(path, ec);
+    return ec ? -1 : static_cast<std::intmax_t>(sz);
 }
 
 } // namespace fnutil

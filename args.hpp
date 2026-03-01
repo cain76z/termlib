@@ -2,581 +2,432 @@
 #define ARGS_HPP
 #pragma once
 
+/**
+ * args.hpp — 커맨드라인 인자 파서 (C++17, 단일 헤더)
+ *
+ * ── 옵션 형식 ──────────────────────────────────────────────────────────────
+ *   --flag              값 없는 플래그   → has("--flag") == true
+ *   --key=value         = 구분 값        → get("--key") == "value"  (항상 동작)
+ *   --key value         공백 구분 값     → value_args에 "--key" 등록 필요
+ *   -f                  단일 대시 플래그 → has("-f") == true
+ *   --                  이후 모든 인자를 파일로 처리
+ *
+ * ── 공백 구분 값 등록 ──────────────────────────────────────────────────────
+ *   ArgsParseOptions opts;
+ *   opts.value_args = {L"--output", L"--threads", L"-o"};
+ *   Args args(argc, argv, opts);
+ *   // args.get(L"--output") → "result.txt"   (app --output result.txt)
+ *
+ *   value_args가 비어있으면 모든 옵션을 플래그로 처리.
+ *   공백 구분 값을 쓰려면 반드시 명시적으로 등록해야 함.
+ *   (이전 버전의 휴리스틱 파싱 제거 — 파일 인자 흡수 버그 수정)
+ *
+ * ── 파일 인자 ──────────────────────────────────────────────────────────────
+ *   옵션이 아닌 인자는 모두 파일로 처리.
+ *   와일드카드(*, ?) 자동 확장, 디렉토리 자동 전개, 중복 제거 지원.
+ *
+ * ── 확장자 필터 ────────────────────────────────────────────────────────────
+ *   opts.include_extensions = {L".cpp", L".hpp"};  // 코드에서 직접 지정
+ *   --include-ext=.cpp,.hpp                         // 커맨드라인에서 지정
+ *   --exclude-ext=.tmp,.bak
+ *   -I=.cpp   -E=.tmp  (단축형)
+ */
+
+#include <algorithm>
+#include <cctype>
+#include <filesystem>
+#include <optional>
+#include <set>
+#include <stdexcept>
 #include <string>
-#include <vector>
 #include <unordered_map>
 #include <unordered_set>
-#include <optional>
-#include <filesystem>
-#include <stdexcept>
-#include <algorithm>
-#include <set>
-#include <cctype>
+#include <vector>
 
-#include "util.hpp"
-#include "fnutil.hpp"
+#include "encode.hpp"   // util::to_wstring, util::to_lower_ascii, util::wstring_to_utf8
+#include "fnutil.hpp"   // fnutil::glob_ex, fnutil::glob_options
 
 #ifdef _WIN32
     #include <windows.h>
     #include <shellapi.h>
 #endif
 
-// 파싱 옵션 구조체
-struct ArgsParseOptions {
-    bool deduplicate_files = true;      // 중복 파일 제거
-    bool verify_exists = false;          // 파일 존재 여부 확인
-    bool throw_on_error = false;         // 에러 발생 시 예외 던지기
-    bool expand_directories = true;      // 디렉토리를 파일 목록으로 확장
-    
-    // 확장자 필터 (소문자로 변환되어 비교됨, 점 포함 예: L".cpp")
-    std::vector<std::wstring> include_extensions;  // 이 확장자만 포함 (비어있으면 모두 포함)
-    std::vector<std::wstring> exclude_extensions;  // 이 확장자는 제외
+// =========================================================
+//  파싱 옵션
+// =========================================================
 
-    // 값을 가지는 옵션 목록 (예: --output, --threads)
-    // 비어있으면 휴리스틱으로 판단: 다음 인자가 옵션이 아니면 값으로 간주
+struct ArgsParseOptions {
+    // ── 파일 처리 ─────────────────────────────────────────
+    bool deduplicate_files   = true;   ///< 중복 파일 제거 (절대 경로 기준)
+    bool verify_exists       = false;  ///< 파일 존재 여부 확인 (false면 비존재 파일도 허용)
+    bool throw_on_error      = false;  ///< 에러 발생 시 예외 던지기
+    bool expand_directories  = true;   ///< 디렉토리를 파일 목록으로 자동 전개
+
+    // ── 확장자 필터 (점 포함, 소문자, 예: L".cpp") ────────
+    std::vector<std::wstring> include_extensions;  ///< 이 확장자만 포함 (빈 경우 모두 포함)
+    std::vector<std::wstring> exclude_extensions;  ///< 이 확장자는 항상 제외
+
+    // ── 공백 구분 값을 가지는 옵션 목록 ──────────────────
+    /// "--output", "--threads" 등을 등록하면 "--output result.txt" 형태로 파싱.
+    /// 비어있으면 모든 옵션을 플래그로 처리. "=" 형식은 항상 동작.
     std::set<std::wstring> value_args;
 };
 
+// =========================================================
+//  Args
+// =========================================================
+
 class Args {
 public:
-    using path = std::filesystem::path;
-    using ParseOptions = ArgsParseOptions;  // 하위 호환성을 위한 별칭
+    using path         = std::filesystem::path;
+    using ParseOptions = ArgsParseOptions;  ///< 하위 호환 별칭
 
     Args(int argc, char* argv[], ArgsParseOptions opts = {})
-        : parse_opts(opts)
+        : opts_(std::move(opts))
     {
-        parse_raw_args(argc, argv);
+        collect_raw_args(argc, argv);
+        parse_options();
+        apply_cmdline_ext_filters();
         expand_files();
     }
 
-    // 옵션 존재 여부 확인
-    bool has(const std::wstring& opt) const {
-        return options.find(opt) != options.end();
+    // ── 옵션 조회 ─────────────────────────────────────────
+
+    /// 옵션 존재 여부 ("--flag", "-f" 등)
+    bool has(const std::wstring& key) const {
+        return options_.count(key) > 0;
     }
 
-    // 옵션 값 가져오기
-    std::wstring get(
-        const std::wstring& opt,
-        const std::wstring& def = L"") const
+    /// 옵션 값 반환 (없거나 플래그이면 def 반환)
+    std::wstring get(const std::wstring& key,
+                     const std::wstring& def = L"") const
     {
-        auto it = options.find(opt);
-        if (it == options.end() || !it->second)
-            return def;
+        auto it = options_.find(key);
+        if (it == options_.end() || !it->second) return def;
         return *it->second;
     }
 
-    // 정수형 옵션 값 가져오기
-    int get_int(
-        const std::wstring& opt,
-        int def = 0) const
-    {
-        auto val = get(opt);
+    /// 정수 변환 (변환 실패 시 def)
+    int get_int(const std::wstring& key, int def = 0) const {
+        const auto val = get(key);
         if (val.empty()) return def;
-        
-        try {
-            return std::stoi(val);
-        } catch (...) {
-            return def;
-        }
+        try { return std::stoi(val); } catch (...) { return def; }
     }
 
-    // bool 옵션 값 가져오기 (--flag 또는 --flag=true/false)
-    bool get_bool(
-        const std::wstring& opt,
-        bool def = false) const
-    {
-        auto it = options.find(opt);
-        if (it == options.end())
-            return def;
+    /// 실수 변환 (변환 실패 시 def)
+    double get_double(const std::wstring& key, double def = 0.0) const {
+        const auto val = get(key);
+        if (val.empty()) return def;
+        try { return std::stod(val); } catch (...) { return def; }
+    }
 
-        if (!it->second) // 값 없이 플래그만 있으면 true
-            return true;
+    /// bool 변환
+    /// - 플래그만 있으면 (값 없음) → true
+    /// - "true"/"1"/"yes"/"on"   → true
+    /// - "false"/"0"/"no"/"off"  → false
+    /// - 그 외                    → def
+    bool get_bool(const std::wstring& key, bool def = false) const {
+        auto it = options_.find(key);
+        if (it == options_.end()) return def;
+        if (!it->second) return true;  // 플래그만 있는 경우
 
-        auto val = util::to_lower_ascii(*it->second);
-        if (val == L"true" || val == L"1" || val == L"yes")
-            return true;
-        if (val == L"false" || val == L"0" || val == L"no")
-            return false;
-
+        const auto val = util::to_lower_ascii(*it->second);
+        if (val == L"true"  || val == L"1" || val == L"yes" || val == L"on")  return true;
+        if (val == L"false" || val == L"0" || val == L"no"  || val == L"off") return false;
         return def;
     }
 
-    // 파일 목록 가져오기
-    const std::vector<path>& files() const {
-        return file_args;
-    }
+    // ── 파일 목록 조회 ────────────────────────────────────
 
-    // 특정 확장자 필터링 (vector 버전)
-    std::vector<path> files(
-        const std::vector<std::wstring>& extensions,
-        bool case_sensitive = false) const 
+    /// 전체 파일 목록
+    const std::vector<path>& files() const { return files_; }
+
+    /// 특정 확장자만 필터링 (단일)
+    std::vector<path> files(const std::wstring& ext,
+                            bool case_sensitive = false) const
     {
-        return filter_by_extensions(file_args, extensions, case_sensitive);
+        return filter_by_ext(files_, {ext}, case_sensitive);
     }
 
-    // 특정 확장자 필터링 (initializer_list 버전)
-    std::vector<path> files(
-        std::initializer_list<std::wstring> extensions,
-        bool case_sensitive = false) const 
+    /// 특정 확장자만 필터링 (복수)
+    std::vector<path> files(const std::vector<std::wstring>& exts,
+                            bool case_sensitive = false) const
     {
-        return filter_by_extensions(file_args, std::vector<std::wstring>(extensions), case_sensitive);
+        return filter_by_ext(files_, exts, case_sensitive);
     }
 
-    // 특정 확장자 필터링 (단일 확장자)
-    std::vector<path> files(
-        const std::wstring& extension,
-        bool case_sensitive = false) const 
+    /// 특정 확장자만 필터링 (initializer_list)
+    std::vector<path> files(std::initializer_list<std::wstring> exts,
+                            bool case_sensitive = false) const
     {
-        return filter_by_extensions(file_args, {extension}, case_sensitive);
+        return filter_by_ext(files_, std::vector<std::wstring>(exts), case_sensitive);
     }
 
-    // 원본 인자 가져오기 (디버깅용)
-    const std::vector<std::wstring>& raw() const {
-        return raw_args;
-    }
+    // ── 디버깅용 ──────────────────────────────────────────
 
-    // 모든 옵션 가져오기
-    const std::unordered_map<std::wstring, std::optional<std::wstring>>& 
-    all_options() const {
-        return options;
-    }
+    /// 파싱 전 원본 인자 목록 (argv[1] 이후)
+    const std::vector<std::wstring>& raw() const { return raw_args_; }
 
+    /// 모든 옵션 맵 (nullopt = 값 없는 플래그)
+    const std::unordered_map<std::wstring, std::optional<std::wstring>>&
+    all_options() const { return options_; }
+
+// =========================================================
+//  private
+// =========================================================
 private:
-    ParseOptions parse_opts;
-    std::vector<std::wstring> raw_args;
-    std::unordered_map<std::wstring, std::optional<std::wstring>> options;
-    std::vector<path> file_args;
+    ArgsParseOptions   opts_;
+    std::vector<std::wstring>  raw_args_;
+    std::unordered_map<std::wstring, std::optional<std::wstring>> options_;
+    std::vector<path>  files_;
 
-    // -----------------------------------------
-    // 확장자로 파일 필터링 (헬퍼 함수)
-    // -----------------------------------------
-    std::vector<path> filter_by_extensions(
-        const std::vector<path>& files,
-        const std::vector<std::wstring>& extensions,
-        bool case_sensitive = false) const 
-    {
-        if (extensions.empty()) {
-            return files;  // 빈 리스트면 모든 파일 반환
-        }
+    // ── 1. argv → raw_args_ ───────────────────────────────
 
-        // 확장자 정규화
-        std::vector<std::wstring> normalized_exts;
-        normalized_exts.reserve(extensions.size());
-        for (const auto& ext : extensions) {
-            auto normalized = ext;
-            
-            // 대소문자 무시 모드면 소문자로 변환
-            if (!case_sensitive) {
-                normalized = util::to_lower_ascii(normalized);
-            }
-            
-            // 점이 없으면 추가
-            if (!normalized.empty() && normalized[0] != L'.') {
-                normalized = L"." + normalized;
-            }
-            
-            normalized_exts.push_back(normalized);
-        }
-
-        // 필터링
-        std::vector<path> result;
-        for (const auto& file : files) {
-            auto file_ext = file.extension().wstring();
-            
-            // 대소문자 무시 모드면 소문자로 변환
-            if (!case_sensitive) {
-                file_ext = util::to_lower_ascii(file_ext);
-            }
-            
-            for (const auto& ext : normalized_exts) {
-                if (file_ext == ext) {
-                    result.push_back(file);
-                    break;
-                }
-            }
-        }
-
-        return result;
-    }
-
-    // -----------------------------------------
-    // 확장자 문자열 파싱 (.cpp,.hpp 형식)
-    // -----------------------------------------
-    std::vector<std::wstring> parse_extensions(const std::wstring& ext_str) const {
-        std::vector<std::wstring> result;
-        if (ext_str.empty()) return result;
-
-        std::wstring current;
-        for (wchar_t c : ext_str) {
-            if (c == L',' || c == L';' || c == L' ') {
-                if (!current.empty()) {
-                    // 점이 없으면 추가
-                    if (current[0] != L'.') {
-                        current = L"." + current;
-                    }
-                    result.push_back(util::to_lower_ascii(current));
-                    current.clear();
-                }
-            } else {
-                current += c;
-            }
-        }
-        
-        if (!current.empty()) {
-            if (current[0] != L'.') {
-                current = L"." + current;
-            }
-            result.push_back(util::to_lower_ascii(current));
-        }
-
-        return result;
-    }
-
-    // -----------------------------------------
-    // 확장자 필터 체크
-    // -----------------------------------------
-    bool should_include_file(const path& p) const {
-        // 디렉토리는 필터링하지 않음
-        std::error_code ec;
-        if (std::filesystem::is_directory(p, ec)) {
-            return true;
-        }
-
-        auto ext = util::to_lower_ascii(p.extension().wstring());
-
-        // 제외 확장자 체크
-        for (const auto& excluded : parse_opts.exclude_extensions) {
-            if (ext == excluded) {
-                return false;
-            }
-        }
-
-        // 포함 확장자 체크 (비어있으면 모두 포함)
-        if (parse_opts.include_extensions.empty()) {
-            return true;
-        }
-
-        for (const auto& included : parse_opts.include_extensions) {
-            if (ext == included) {
-                return true;
-            }
-        }
-
-        return false;  // 포함 목록에 없으면 제외
-    }
-
-    // -----------------------------------------
-    // argv → wstring + 옵션 분리
-    // Windows/Linux 모두에서 올바른 인코딩 보장
-    // -----------------------------------------
-    void parse_raw_args(int argc, char* argv[]) {
+    void collect_raw_args(int argc, char* argv[]) {
 #ifdef _WIN32
-        // Windows: CommandLineToArgvW로 유니코드 직접 획득
+        // Windows: CommandLineToArgvW로 정확한 유니코드 획득
         int wargc = 0;
         LPWSTR* wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
-        
         if (!wargv) {
-            if (parse_opts.throw_on_error)
+            if (opts_.throw_on_error)
                 throw std::runtime_error("Failed to parse command line");
             return;
         }
-
-        // argv[0]은 프로그램 이름이므로 제외
-        for (int i = 1; i < wargc; ++i) {
-            raw_args.emplace_back(wargv[i]);
-        }
-
+        for (int i = 1; i < wargc; ++i)
+            raw_args_.emplace_back(wargv[i]);
         LocalFree(wargv);
 #else
-        // Linux: 현재 로케일 확인 후 적절한 변환
-        // 대부분의 현대 Linux는 UTF-8을 사용하지만, 
-        // 다른 인코딩도 지원하기 위해 로케일 기반 변환 사용
-        
-        // 시스템 로케일 설정 (인코딩 변환에 필요)
+        // Linux/macOS: 시스템 인코딩(보통 UTF-8) → wstring
         std::setlocale(LC_ALL, "");
-        
         for (int i = 1; i < argc; ++i) {
-            // argv는 시스템 인코딩(보통 UTF-8)으로 되어 있음
-            // util::to_wstring이 자동으로 감지하여 변환
             std::string arg(argv[i]);
-            
-            // 인코딩 자동 감지 및 변환
-            auto warg = util::to_wstring(arg);
-            
-            if (warg.empty() && !arg.empty()) {
-                // 변환 실패 시 ANSI로 재시도
-                warg = util::ansi_to_wstring(arg);
-            }
-            
-            raw_args.emplace_back(warg);
+            auto ws = util::to_wstring(arg);
+            if (ws.empty() && !arg.empty())
+                ws = util::ansi_to_wstring(arg);  // 폴백
+            raw_args_.emplace_back(std::move(ws));
         }
 #endif
-
-        // 옵션 파싱
-        parse_options();
     }
 
-    // -----------------------------------------
-    // 옵션과 파일 인자 분리
-    // -----------------------------------------
+    // ── 2. 옵션과 파일 분리 ───────────────────────────────
+
     void parse_options() {
-        for (size_t i = 0; i < raw_args.size(); ++i) {
-            const auto& arg = raw_args[i];
+        for (size_t i = 0; i < raw_args_.size(); ++i) {
+            const auto& arg = raw_args_[i];
+            if (arg.empty()) continue;
 
-            if (arg.empty())
-                continue;
-
-            // -- 는 옵션 종료 마커
+            // "--" → 이후 모든 인자를 파일로 처리
             if (arg == L"--") {
-                // 이후 모든 인자는 파일로 취급
-                for (size_t j = i + 1; j < raw_args.size(); ++j) {
-                    file_args.emplace_back(raw_args[j]);
-                }
+                for (size_t j = i + 1; j < raw_args_.size(); ++j)
+                    files_.emplace_back(raw_args_[j]);
                 break;
             }
 
-            // -- 또는 - 로 시작하는 옵션
             if (arg[0] == L'-') {
-                // --option=value 형식 파싱
-                auto eq_pos = arg.find(L'=');
-                if (eq_pos != std::wstring::npos) {
-                    auto key = arg.substr(0, eq_pos);
-                    auto val = arg.substr(eq_pos + 1);
-                    options[key] = val;
+                // "--key=value" 형식 — 항상 동작, value_args 등록 불필요
+                auto eq = arg.find(L'=');
+                if (eq != std::wstring::npos) {
+                    options_[arg.substr(0, eq)] = arg.substr(eq + 1);
                     continue;
                 }
 
-                // 이 옵션이 값을 가지는지 판단
-                bool takes_value = false;
-
-                if (parse_opts.value_args.empty()) {
-                    // value_args가 비어있으면 휴리스틱 사용:
-                    // 다음 인자가 존재하고 옵션이 아니면 값으로 간주
-                    takes_value = (i + 1 < raw_args.size() && 
-                                  !raw_args[i + 1].empty() &&
-                                  raw_args[i + 1][0] != L'-');
-                } else {
-                    // value_args에 명시적으로 지정된 경우만 값을 가짐
-                    takes_value = (parse_opts.value_args.count(arg) > 0);
-                }
-
-                // 값을 가지는 옵션이고, 다음 인자가 유효하면
-                if (takes_value && 
-                    i + 1 < raw_args.size() && 
-                    !raw_args[i + 1].empty() &&
-                    raw_args[i + 1][0] != L'-') 
+                // "--key value" 형식 — value_args에 등록된 경우에만
+                if (opts_.value_args.count(arg) &&
+                    i + 1 < raw_args_.size() &&
+                    !raw_args_[i + 1].empty())
                 {
-                    // --option value 형식
-                    options[arg] = raw_args[i + 1];
-                    ++i; // 다음 인자를 값으로 사용했으므로 건너뜀
-                } 
-                else {
-                    // --flag 형식 (값 없는 플래그)
-                    options[arg] = std::nullopt;
+                    options_[arg] = raw_args_[++i];
+                    continue;
                 }
-            } 
+
+                // 플래그
+                options_[arg] = std::nullopt;
+            }
             else {
-                // 옵션이 아닌 일반 파일 인자
-                file_args.emplace_back(arg);
+                // 옵션이 아닌 인자 → 파일
+                files_.emplace_back(arg);
             }
-        }
-
-        // 명령줄에서 확장자 필터 옵션 파싱
-        parse_extension_filters();
-    }
-
-    // -----------------------------------------
-    // 명령줄 옵션에서 확장자 필터 추출
-    // -----------------------------------------
-    void parse_extension_filters() {
-        // 포함 확장자: --include-ext=.cpp,.hpp 또는 -I=.cpp
-        if (has(L"--include-ext")) {
-            auto exts = get(L"--include-ext");
-            auto parsed = parse_extensions(exts);
-            parse_opts.include_extensions.insert(
-                parse_opts.include_extensions.end(),
-                parsed.begin(), parsed.end());
-        }
-        if (has(L"-I")) {
-            auto exts = get(L"-I");
-            auto parsed = parse_extensions(exts);
-            parse_opts.include_extensions.insert(
-                parse_opts.include_extensions.end(),
-                parsed.begin(), parsed.end());
-        }
-
-        // 제외 확장자: --exclude-ext=.tmp,.bak 또는 -E=.tmp
-        if (has(L"--exclude-ext")) {
-            auto exts = get(L"--exclude-ext");
-            auto parsed = parse_extensions(exts);
-            parse_opts.exclude_extensions.insert(
-                parse_opts.exclude_extensions.end(),
-                parsed.begin(), parsed.end());
-        }
-        if (has(L"-E")) {
-            auto exts = get(L"-E");
-            auto parsed = parse_extensions(exts);
-            parse_opts.exclude_extensions.insert(
-                parse_opts.exclude_extensions.end(),
-                parsed.begin(), parsed.end());
         }
     }
 
-    // -----------------------------------------
-    // 옵션 → glob 옵션 변환
-    // -----------------------------------------
-    fnutil::glob_options make_glob_options() const {
-        fnutil::glob_options opt;
+    // ── 3. 커맨드라인에서 확장자 필터 옵션 적용 ──────────
 
-        // 재귀 검색
-        opt.recursive = get_bool(L"--recursive") || 
-                        get_bool(L"-R") ||
-                        get_bool(L"-r");
-
-        // 대소문자 무시 (기본값 true)
-        if (has(L"--case-sensitive") || has(L"-C")) {
-            opt.ignoreCase = false;
-        } else {
-            opt.ignoreCase = true;
-        }
-
-        // 디렉토리 포함
-        opt.include_directories = get_bool(L"--include-dirs") ||
-                                  get_bool(L"-D");
-
-        // 절대 경로 사용
-        opt.absolute = !get_bool(L"--relative");
-
-        return opt;
-    }
-
-    // -----------------------------------------
-    // 파일 인자 확장 (glob / 디렉토리)
-    // -----------------------------------------
-    void expand_files() {
-        if (file_args.empty())
-            return;
-
-        std::vector<path> expanded;
-        std::unordered_set<std::wstring> seen; // 중복 제거용
-        auto glob_opt = make_glob_options();
-
-        for (const auto& p : file_args) {
-            try {
-                expand_single_path(p, expanded, seen, glob_opt);
-            }
-            catch (const std::exception& e) {
-                if (parse_opts.throw_on_error)
-                    throw;
-                // 에러 무시하고 계속 진행
-            }
-        }
-
-        file_args = std::move(expanded);
-    }
-
-    // -----------------------------------------
-    // 단일 경로 확장
-    // -----------------------------------------
-    void expand_single_path(
-        const path& p,
-        std::vector<path>& expanded,
-        std::unordered_set<std::wstring>& seen,
-        const fnutil::glob_options& glob_opt)
-    {
-        const std::wstring ws = p.wstring();
-
-        // 와일드카드 포함 → glob_ex
-        bool has_wildcard = (ws.find(L'*') != std::wstring::npos ||
-                            ws.find(L'?') != std::wstring::npos);
-
-        if (has_wildcard) {
-            auto matches = fnutil::glob_ex(p, glob_opt);
-            
-            // glob_ex가 실패하면 원본을 반환하는데,
-            // 원본이 와일드카드를 포함하면 실제 파일이 아니므로 검증
-            if (matches.size() == 1 && matches[0] == p) {
-                // 매칭 실패 - 원본이 와일드카드면 스킵
-                if (parse_opts.verify_exists)
-                    return;  // 존재하지 않으므로 무시
-                // verify_exists가 false여도 와일드카드 패턴 자체는 파일이 아니므로 무시
-                return;
-            }
-
-            for (const auto& match : matches) {
-                add_file_if_valid(match, expanded, seen);
-            }
-        }
-        else if (std::filesystem::exists(p) && 
-                 std::filesystem::is_directory(p) &&
-                 parse_opts.expand_directories) 
+    void apply_cmdline_ext_filters() {
+        auto append_exts = [&](const std::wstring& key,
+                               std::vector<std::wstring>& target)
         {
-            // 디렉토리 → 내부 파일 확장
-            auto matches = fnutil::glob_ex(p / L"*", glob_opt);
-            
-            for (const auto& match : matches) {
-                add_file_if_valid(match, expanded, seen);
+            if (has(key)) {
+                auto parsed = split_extensions(get(key));
+                target.insert(target.end(), parsed.begin(), parsed.end());
             }
+        };
+
+        append_exts(L"--include-ext", opts_.include_extensions);
+        append_exts(L"-I",            opts_.include_extensions);
+        append_exts(L"--exclude-ext", opts_.exclude_extensions);
+        append_exts(L"-E",            opts_.exclude_extensions);
+    }
+
+    // ── 4. 파일 확장 (glob / 디렉토리 전개) ──────────────
+
+    void expand_files() {
+        if (files_.empty()) return;
+
+        std::vector<path>             expanded;
+        std::unordered_set<std::wstring> seen;
+        const auto glob_opt = make_glob_options();
+
+        for (const auto& p : files_) {
+            try {
+                expand_single(p, expanded, seen, glob_opt);
+            } catch (...) {
+                if (opts_.throw_on_error) throw;
+            }
+        }
+        files_ = std::move(expanded);
+    }
+
+    void expand_single(const path& p,
+                       std::vector<path>& out,
+                       std::unordered_set<std::wstring>& seen,
+                       const fnutil::glob_options& glob_opt)
+    {
+        const auto ws = p.wstring();
+        const bool has_wild = ws.find(L'*') != std::wstring::npos ||
+                              ws.find(L'?') != std::wstring::npos;
+
+        if (has_wild) {
+            // 와일드카드 → glob_ex
+            // glob_ex는 매칭 실패 시 원본 경로를 반환하므로 걸러냄
+            auto matches = fnutil::glob_ex(p, glob_opt);
+            if (matches.size() == 1 && matches[0] == p) return; // 매칭 실패
+            for (const auto& m : matches)
+                add_if_valid(m, out, seen);
+        }
+        else if (opts_.expand_directories &&
+                 std::filesystem::is_directory(p))
+        {
+            // 디렉토리 → 내부 파일 전개
+            for (const auto& m : fnutil::glob_ex(p / L"*", glob_opt))
+                add_if_valid(m, out, seen);
         }
         else {
-            // 일반 파일 또는 존재하지 않는 경로
-            add_file_if_valid(p, expanded, seen);
+            add_if_valid(p, out, seen);
         }
     }
 
-    // -----------------------------------------
-    // 유효한 파일만 추가 (중복 제거 포함)
-    // -----------------------------------------
-    void add_file_if_valid(
-        const path& p,
-        std::vector<path>& expanded,
-        std::unordered_set<std::wstring>& seen)
+    void add_if_valid(const path& p,
+                      std::vector<path>& out,
+                      std::unordered_set<std::wstring>& seen)
     {
-        // 확장자 필터 체크
-        if (!should_include_file(p)) {
-            return;  // 필터에 맞지 않으면 스킵
-        }
+        if (!passes_ext_filter(p)) return;
 
-        // 존재 여부 확인
-        if (parse_opts.verify_exists) {
+        if (opts_.verify_exists) {
             std::error_code ec;
             if (!std::filesystem::exists(p, ec)) {
-                if (parse_opts.throw_on_error) {
+                if (opts_.throw_on_error)
                     throw std::runtime_error(
-                        "File not found: " + 
-                        util::wstring_to_utf8(p.wstring()));
-                }
-                return; // 존재하지 않으면 스킵
-            }
-        }
-
-        // 중복 제거
-        if (parse_opts.deduplicate_files) {
-            std::wstring canonical_path;
-            
-            try {
-                // 절대 경로로 정규화하여 중복 체크
-                canonical_path = std::filesystem::absolute(p).wstring();
-                
-                // Windows: 대소문자 무시 비교를 위해 소문자 변환
-                // Linux: 대소문자 구분이 중요하므로 원본 유지
-#ifdef _WIN32
-                canonical_path = util::to_lower_ascii(canonical_path);
-#endif
-            }
-            catch (...) {
-                // 정규화 실패 시 원본 경로 사용
-                canonical_path = p.wstring();
-            }
-
-            // 이미 추가된 파일인지 확인
-            if (seen.find(canonical_path) != seen.end())
+                        "File not found: " + util::wstring_to_utf8(p.wstring()));
                 return;
-
-            seen.insert(canonical_path);
+            }
         }
 
-        expanded.push_back(p);
+        if (opts_.deduplicate_files) {
+            std::wstring key;
+            try {
+                key = std::filesystem::absolute(p).wstring();
+#ifdef _WIN32
+                key = util::to_lower_ascii(key); // Windows: 대소문자 무시
+#endif
+            } catch (...) {
+                key = p.wstring();
+            }
+            if (!seen.insert(key).second) return; // 이미 추가됨
+        }
+
+        out.push_back(p);
+    }
+
+    // ── 헬퍼: 확장자 필터 ────────────────────────────────
+
+    /// 파일이 include/exclude 필터를 통과하는지 확인
+    bool passes_ext_filter(const path& p) const {
+        std::error_code ec;
+        if (std::filesystem::is_directory(p, ec)) return true;
+
+        const auto ext = util::to_lower_ascii(p.extension().wstring());
+
+        for (const auto& ex : opts_.exclude_extensions)
+            if (ext == ex) return false;
+
+        if (opts_.include_extensions.empty()) return true;
+
+        for (const auto& in : opts_.include_extensions)
+            if (ext == in) return true;
+
+        return false;
+    }
+
+    /// 확장자 목록으로 파일 필터링
+    static std::vector<path> filter_by_ext(
+        const std::vector<path>& files,
+        const std::vector<std::wstring>& exts,
+        bool case_sensitive)
+    {
+        if (exts.empty()) return files;
+
+        // 정규화된 확장자 목록 구성 (점 추가, 대소문자 통일)
+        std::vector<std::wstring> norm;
+        norm.reserve(exts.size());
+        for (auto e : exts) {
+            if (!case_sensitive) e = util::to_lower_ascii(e);
+            if (!e.empty() && e[0] != L'.') e = L"." + e;
+            norm.push_back(std::move(e));
+        }
+
+        std::vector<path> result;
+        for (const auto& f : files) {
+            auto fext = f.extension().wstring();
+            if (!case_sensitive) fext = util::to_lower_ascii(fext);
+            if (std::find(norm.begin(), norm.end(), fext) != norm.end())
+                result.push_back(f);
+        }
+        return result;
+    }
+
+    // ── 헬퍼: 확장자 문자열 파싱 ─────────────────────────
+
+    /// ".cpp,.hpp" 또는 "cpp;hpp cpp" → {L".cpp", L".hpp"}
+    static std::vector<std::wstring> split_extensions(const std::wstring& s) {
+        std::vector<std::wstring> result;
+        std::wstring cur;
+
+        auto flush = [&]{
+            if (cur.empty()) return;
+            if (cur[0] != L'.') cur = L"." + cur;
+            result.push_back(util::to_lower_ascii(cur));
+            cur.clear();
+        };
+
+        for (wchar_t c : s) {
+            if (c == L',' || c == L';' || c == L' ') flush();
+            else cur += c;
+        }
+        flush();
+        return result;
+    }
+
+    // ── 헬퍼: glob 옵션 구성 ─────────────────────────────
+
+    fnutil::glob_options make_glob_options() const {
+        fnutil::glob_options opt;
+        opt.recursive           = get_bool(L"--recursive") ||
+                                  get_bool(L"-R") ||
+                                  get_bool(L"-r");
+        opt.ignoreCase          = !(has(L"--case-sensitive") || has(L"-C"));
+        opt.include_directories = get_bool(L"--include-dirs") || get_bool(L"-D");
+        opt.absolute            = !get_bool(L"--relative");
+        return opt;
     }
 };
 
