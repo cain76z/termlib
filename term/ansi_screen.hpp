@@ -140,8 +140,10 @@ public:
             } else if (seg.type == T::Text) {
                 auto clusters = UniString::split(seg.text);
                 for (const auto& g : clusters) {
-                    if (x >= cols_) { x = 0; ++y; }
-                    if (y >= rows_) goto done;
+                    if (y < 0 || y >= rows_) goto done;
+                    // 화면 오른쪽 경계 초과 시 줄바꿈하지 않고 해당 행 출력 중단
+                    // (wrapping 이 허용되면 다음 행 내용이 밀려 화면이 깨짐)
+                    if (x >= cols_) break;
                     Cell c;
                     c.grapheme = g.bytes;
                     c.width    = static_cast<uint8_t>(
@@ -149,6 +151,13 @@ public:
                     c.fg   = seg.fg;
                     c.bg   = seg.bg;
                     c.attr = seg.attr;
+                    // 2열 문자가 마지막 열에 걸치면 공백으로 대체
+                    if (x + c.width > cols_) {
+                        Cell sp; sp.grapheme = " "; sp.width = 1;
+                        sp.fg = c.fg; sp.bg = c.bg; sp.attr = c.attr;
+                        put_cell(x, y, sp);
+                        break;
+                    }
                     put_cell(x, y, c);
                     x += c.width;
                 }
@@ -213,6 +222,7 @@ public:
     [[nodiscard]] const Cell& cell_at(int x, int y) const {
         assert(in_bounds(x, y)); return buf_[idx(x, y)];
     }
+    [[nodiscard]] bool in_bounds_pub(int x, int y) const noexcept { return in_bounds(x, y); }
     [[nodiscard]] const Cell& prev_cell_at(int x, int y) const {
         assert(in_bounds(x, y)); return prev_buf_[idx(x, y)];
     }
@@ -235,6 +245,40 @@ public:
      *  - 다이얼로그 rect 내부: dlg.render() 후 달라짐 → 정상 출력 ✓
      */
     void sync_buffer() { buf_ = prev_buf_; }
+
+    // ── 영역 저장 / 복원 (다이얼로그 배경 보존용) ─────────────────────────
+    /**
+     * save_region()    — 지정 영역의 셀을 벡터로 반환 (다이얼로그 열기 전)
+     * restore_region() — save_region() 결과를 원위치 복원 후 dirty 표시
+     *
+     * 사용 패턴:
+     *   auto bg = screen.save_region(x, y, w, h);
+     *   ... 다이얼로그 이벤트 루프 ...
+     *   screen.restore_region(x, y, w, h, bg);
+     *   renderer.render_full();   // 터미널에 복원 출력
+     */
+    [[nodiscard]] std::vector<Cell>
+    save_region(int x, int y, int w, int h) const {
+        std::vector<Cell> saved;
+        saved.reserve(static_cast<size_t>(w * h));
+        for (int r = y; r < y + h; ++r)
+            for (int c = x; c < x + w; ++c)
+                saved.push_back(in_bounds(c, r) ? buf_[idx(c, r)] : Cell{});
+        return saved;
+    }
+
+    void restore_region(int x, int y, int w, int h,
+                        const std::vector<Cell>& saved) {
+        int si = 0;
+        for (int r = y; r < y + h; ++r) {
+            for (int c = x; c < x + w; ++c, ++si) {
+                if (!in_bounds(c, r) || si >= (int)saved.size()) continue;
+                int bi = idx(c, r);
+                buf_[bi] = saved[si];
+                mark_dirty(bi, r);
+            }
+        }
+    }
 
     // ── 커서 ──────────────────────────────────────────────────────────────
     [[nodiscard]] int cursor_x() const noexcept { return cur_x_; }

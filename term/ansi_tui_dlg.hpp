@@ -824,36 +824,75 @@ private:
 template<typename Dialog>
 inline void run_dialog(Dialog& dlg, AnsiScreen& screen,
                        AnsiRenderer& renderer, InputDriver& input) {
-    // ── 다이얼로그 진입: 화면 전체를 공백으로 초기화 후 강제 전체 출력 ──────
+    // ── 1단계: rect 확정 (화면에 쓰지 않고 위치/크기만 계산) ──────────────────
+    // calc_dialog_rect() 는 screen 크기만 보고 rect를 계산한다.
+    // Widget::calc_rect() 가 없으므로 render() 로 rect_ 를 세팅한 뒤
+    // 저장 전에 buf_ 를 원상복구해야 순서가 맞는다.
     //
-    // [잘못된 방법] invalidate_all() 또는 sync_buffer() 만 사용
-    //   → buf_ 바깥 영역이 여전히 이전 화면 내용을 담고 있음
-    //   → optimizer가 "바뀐 셀 없음" 으로 판단 → 터미널 배경 글자 잔상
+    // 더 간단한 방법: dlg 내부 calc_dialog_rect 호출 결과를 직접 재현
+    //   dlg_detail::calc_dialog_rect(screen, opts_.dialog_w, opts_.dialog_h)
+    // 하지만 opts_ 가 private 이므로, render() → rect() 순서로 취득한 뒤
+    // 저장은 clear() 이전에 수행한다.
     //
-    // [올바른 방법]
-    //   1. screen.clear()  → buf_ 전체를 공백 셀로 채움
-    //   2. dlg.render()    → 공백 위에 다이얼로그 영역만 씀
-    //   3. render_full()   → prev_buf_ 비교 없이 모든 셀 터미널에 출력
-    //                        → 배경=공백(기존 글자 덮어씀) + 다이얼로그 표시
-    screen.clear();
-    dlg.render(screen);
-    renderer.render_full();    // 터미널 전체 재출력 (잔상 제거)
+    //  [정확한 순서]
+    //  a) dlg.render(screen)  → rect_ 확정 + buf_ 에 다이얼로그 셀 기록
+    //  b) r = dlg.rect()      → 위치/크기 취득
+    //  c) saved_bg 저장 시    → buf_[r] 는 이미 다이얼로그 내용 (잘못됨)
+    //
+    //  [해결] render() 전에 rect 를 미리 알아야 함.
+    //  dlg_detail::calc_dialog_rect() 는 public 이므로 직접 호출 가능.
+    //  단, dialog_w/dialog_h 가 필요 → dlg.hint_size() 접근자를 Widget 에 추가하거나
+    //  render() 후 restore + save 두 단계를 쓴다.
+    //
+    //  [가장 단순한 해결]
+    //  render() 로 rect 취득 → 저장은 prev_buf_ 에서 읽음 (터미널 실제 내용)
+    //  prev_buf_ 는 renderer.render() 를 마지막으로 호출한 시점의 화면 상태.
 
+    // rect 확정
+    dlg.render(screen);
+    const Widget::Rect r = dlg.rect();
+
+    // ── 2단계: 배경 저장 — prev_buf_ 기준 (터미널 실제 출력 내용) ─────────────
+    // buf_ 는 이미 dlg.render() 로 덮어씌워졌으므로 prev_buf_ 에서 저장한다.
+    // prev_buf_ = 마지막 renderer.render()/render_full() 직후의 화면 상태.
+    std::vector<Cell> saved_bg;
+    saved_bg.reserve(static_cast<size_t>(r.w * r.h));
+    for (int ry = r.y; ry < r.y + r.h; ++ry)
+        for (int cx = r.x; cx < r.x + r.w; ++cx)
+            saved_bg.push_back(screen.in_bounds_pub(cx, ry)
+                               ? screen.prev_cell_at(cx, ry) : Cell{});
+
+    // ── 3단계: 다이얼로그 영역만 지우고 다이얼로그 렌더 → 증분 출력 ───────────
+    screen.clear(r.x, r.y, r.w, r.h);
+    dlg.render(screen);
+    renderer.render();
+
+    // ── 4단계: 이벤트 루프 ──────────────────────────────────────────────────
     while (!dlg.closed()) {
         dlg.render(screen);
-        renderer.render();     // 변경된 셀만 증분 출력 (빠름)
+        renderer.render();
         auto ev = input.read_key();
         if (ev.key == KEY_RESIZE) {
             renderer.handle_resize();
-            screen.clear();
+            dlg.render(screen);
+            const Widget::Rect nr = dlg.rect();
+            saved_bg.clear();
+            saved_bg.reserve(static_cast<size_t>(nr.w * nr.h));
+            for (int ry = nr.y; ry < nr.y + nr.h; ++ry)
+                for (int cx = nr.x; cx < nr.x + nr.w; ++cx)
+                    saved_bg.push_back(screen.in_bounds_pub(cx, ry)
+                                       ? screen.prev_cell_at(cx, ry) : Cell{});
+            screen.clear(nr.x, nr.y, nr.w, nr.h);
             dlg.render(screen);
             renderer.render_full();
         } else {
             dlg.handle_key(ev);
         }
     }
-    // 다이얼로그 닫힌 후: 호출자가 배경을 다시 그리도록 dirty 표시
-    screen.invalidate_all();
+
+    // ── 5단계: 배경 복원 → 다이얼로그 잔상 제거 ─────────────────────────────
+    screen.restore_region(r.x, r.y, r.w, r.h, saved_bg);
+    renderer.render();
 }
 
 } // namespace term
