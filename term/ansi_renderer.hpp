@@ -1,211 +1,165 @@
 #pragma once
 /**
- * ansi_renderer.hpp — 배치 출력 엔진  (TDD §8)
+ * @file ansi_renderer.hpp
+ * @brief 배치 출력 엔진  (TDD §8)
+ *
+ * `AnsiScreen` + `AnsiOptimizer` → ANSI 바이트 스트림 → `Terminal::write()`
+ *
+ * ## 역할 분리
+ *
+ * | 클래스 | 파일 | 역할 |
+ * |--------|------|------|
+ * | `Terminal`     | `term_info.hpp`       | 터미널 초기화·제어·정보 조회 |
+ * | `AnsiScreen`   | `ansi_screen.hpp`     | 논리 셀 버퍼 관리 |
+ * | `AnsiOptimizer`| `ansi_optimizer.hpp`  | diff 최소 이스케이프 생성 |
+ * | `AnsiRenderer` | `ansi_renderer.hpp`   | 위 세 요소를 조합한 렌더 루프 |
+ *
+ * ## 사용 예시
+ *
+ * ```cpp
+ * term::Terminal   term;                          // 터미널 초기화
+ * term::AnsiScreen screen(term.cols(), term.rows()); // 버퍼 생성
+ * term::AnsiRenderer renderer(screen, term);      // 렌더러 연결
+ *
+ * term.enter_alt_screen();
+ * term.show_cursor(false);
+ *
+ * // ... screen 에 셀 쓰기 ...
+ *
+ * renderer.render();       // dirty 셀만 출력
+ * renderer.render_full();  // 전체 재출력
+ * renderer.handle_resize(); // SIGWINCH 후 크기 갱신
+ * ```
+ *
+ * ## 의존 방향
+ * ```
+ * platform.hpp
+ *   └── term_info.hpp      (Terminal, ColorLevel, TermSize, 자유함수)
+ *   └── ansi_screen.hpp
+ *         └── ansi_optimizer.hpp
+ *               └── ansi_renderer.hpp   ← 이 파일
+ * ```
  *
  * 구현부가 모두 클래스 본체 안에 위치한다.
- * 자유 함수 detect_color_level / get_terminal_size 는 클래스 밖이지만
- * inline 으로 ODR 위반 없이 단일 정의된다.  [BUG-01]
  */
-#include "platform.hpp"
+#include "term_info.hpp"
 #include "ansi_optimizer.hpp"
-#include <cstdlib>
-#include <string>
-#include <string_view>
-
-#if defined(TERM_PLATFORM_POSIX)
-#  include <sys/ioctl.h>
-#  include <unistd.h>
-#endif
 
 namespace term {
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  자유 함수  (클래스 밖 — inline 으로 ODR 안전)  [BUG-01]
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// 터미널 컬러 지원 레벨
-enum class ColorLevel { None, Basic8, Index256, TrueColor };
-
-/// 현재 터미널의 컬러 레벨 감지
-[[nodiscard]] inline ColorLevel detect_color_level() noexcept {
-#if defined(TERM_PLATFORM_WINDOWS)
-    if (std::getenv("WT_SESSION")) return ColorLevel::TrueColor;
-    if (auto* ct = std::getenv("COLORTERM"); ct) {
-        std::string_view sv(ct);
-        if (sv == "truecolor" || sv == "24bit") return ColorLevel::TrueColor;
-        if (sv == "256color")                   return ColorLevel::Index256;
-    }
-    return ColorLevel::Index256;
-#else
-    if (std::getenv("WT_SESSION")) return ColorLevel::TrueColor;
-    if (auto* ct = std::getenv("COLORTERM"); ct) {
-        std::string_view sv(ct);
-        if (sv == "truecolor" || sv == "24bit") return ColorLevel::TrueColor;
-        if (sv == "256color")                   return ColorLevel::Index256;
-    }
-    if (auto* term = std::getenv("TERM"); term) {
-        std::string_view sv(term);
-        if (sv.find("256color") != std::string_view::npos) return ColorLevel::Index256;
-        if (sv == "xterm" || sv == "screen" ||
-            sv == "xterm-color")                            return ColorLevel::Index256;
-        if (sv == "dumb")                                   return ColorLevel::None;
-    }
-    if (std::getenv("CI")) return ColorLevel::Basic8;
-    return ColorLevel::Basic8;
-#endif
-}
-
-/// 터미널 크기 조회
-struct TermSize { int cols; int rows; };
-
-[[nodiscard]] inline TermSize get_terminal_size() noexcept {
-#if defined(TERM_PLATFORM_WINDOWS)
-    CONSOLE_SCREEN_BUFFER_INFO csbi{};
-    if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi))
-        return { csbi.srWindow.Right  - csbi.srWindow.Left + 1,
-                 csbi.srWindow.Bottom - csbi.srWindow.Top  + 1 };
-    return {80, 24};
-#else
-    struct winsize ws{};
-    if (::ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
-        return { ws.ws_col, ws.ws_row };
-    const char* ce = std::getenv("COLUMNS");
-    const char* re = std::getenv("LINES");
-    return { ce ? std::atoi(ce) : 80, re ? std::atoi(re) : 24 };
-#endif
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
 //  AnsiRenderer  (TDD §8)
-//  구현부가 모두 클래스 본체 안에 위치한다.
+//  AnsiScreen + AnsiOptimizer 를 Terminal 을 통해 출력하는 렌더 루프
 // ═══════════════════════════════════════════════════════════════════════════
 
+/**
+ * @brief ANSI 터미널 배치 출력 엔진
+ *
+ * `AnsiScreen`(논리 버퍼)의 dirty 셀을 `AnsiOptimizer`로 최소 이스케이프 시퀀스로
+ * 변환하여 `Terminal`을 통해 실제 터미널에 씁니다.
+ *
+ * ### 생성자
+ * ```cpp
+ * term::Terminal   term;
+ * term::AnsiScreen screen(80, 24);
+ * term::AnsiRenderer renderer(screen, term);
+ * ```
+ *
+ * ### 렌더 루프
+ * ```cpp
+ * // dirty 셀만 출력 (일반 루프)
+ * renderer.render();
+ *
+ * // 전체 화면 강제 재출력 (크기 변경 등)
+ * renderer.render_full();
+ *
+ * // SIGWINCH 수신 후 터미널 크기 갱신 + 전체 재출력
+ * renderer.handle_resize();
+ * ```
+ */
 class AnsiRenderer {
 public:
-    explicit AnsiRenderer(AnsiScreen& screen)
-        : screen_(screen)
-    {
-        color_level_ = detect_color_level();
-        setup();
-    }
+    /**
+     * @brief 렌더러를 생성합니다.
+     *
+     * @param screen  렌더 대상 논리 화면 버퍼 (수명이 렌더러보다 길어야 함)
+     * @param term    출력을 담당할 터미널 (수명이 렌더러보다 길어야 함)
+     */
+    explicit AnsiRenderer(AnsiScreen& screen, Terminal& term)
+        : screen_(screen), term_(term)
+    {}
 
-    ~AnsiRenderer() {
-        if (in_alt_screen_) leave_alt_screen();
-    }
+    // 복사/이동 금지 (레퍼런스 멤버 소유)
+    AnsiRenderer(const AnsiRenderer&)            = delete;
+    AnsiRenderer& operator=(const AnsiRenderer&) = delete;
+    AnsiRenderer(AnsiRenderer&&)                 = delete;
+    AnsiRenderer& operator=(AnsiRenderer&&)      = delete;
 
     // ── 렌더링 ────────────────────────────────────────────────────────────
+
+    /**
+     * @brief dirty 셀만 출력합니다 (증분 렌더).
+     *
+     * `screen_.any_dirty()` 가 false 이면 아무 것도 출력하지 않습니다.
+     * 렌더 후 스냅샷을 갱신하고 dirty 플래그를 초기화합니다.
+     */
     void render() {
         if (!screen_.any_dirty()) return;
         std::string out = optimizer_.optimize(screen_);
         screen_.snapshot();
         screen_.clear_dirty();
-        platform_write(out);
+        term_.write(out);
+        term_.flush();
     }
 
+    /**
+     * @brief 화면 전체를 강제로 재출력합니다.
+     *
+     * 이전 프레임과 diff 없이 모든 셀을 출력합니다.
+     * 크기 변경 직후, 초기화 시, 외부 화면 오염 복구 등에 사용합니다.
+     */
     void render_full() {
         screen_.invalidate_all();
         std::string out = optimizer_.full_redraw(screen_);
         screen_.snapshot();
         screen_.clear_dirty();
-        platform_write(out);
+        term_.write(out);
+        term_.flush();
     }
 
-    // ── 화면 모드 ─────────────────────────────────────────────────────────
-    void enter_alt_screen() {
-        platform_write("\x1b[?1049h");
-        platform_write("\x1b[2J");
-        platform_write("\x1b[H");
-        in_alt_screen_ = true;
-    }
-
-    void leave_alt_screen() {
-        if (!in_alt_screen_) return;
-        show_cursor(true);
-        platform_write("\x1b[?1049l");
-        in_alt_screen_ = false;
-    }
-
-    // ── 커서 / 제어 ───────────────────────────────────────────────────────
-    void show_cursor(bool visible) {
-        platform_write(visible ? "\x1b[?25h" : "\x1b[?25l");
-    }
-
-    void move_cursor(int x, int y) {
-        std::string s = "\x1b[";
-        s += std::to_string(y + 1); s += ';';
-        s += std::to_string(x + 1); s += 'H';
-        platform_write(s);
-    }
-
-    void set_title(std::string_view title) {
-        std::string s = "\x1b]0;";
-        s.append(title); s += "\x07";
-        platform_write(s);
-    }
-
-    void clear_screen() { platform_write("\x1b[2J\x1b[H"); }
-
-    // ── 리사이즈 ──────────────────────────────────────────────────────────
+    /**
+     * @brief 터미널 크기 변경(SIGWINCH)을 처리합니다.
+     *
+     * 현재 터미널 크기를 다시 조회하여 `AnsiScreen`을 리사이즈하고,
+     * 전체 화면을 재출력합니다.
+     */
     void handle_resize() {
-        auto [nc, nr] = get_terminal_size();
+        auto [nc, nr] = term_.size();
         screen_.resize(nc, nr);
         render_full();
     }
 
-    [[nodiscard]] ColorLevel color_level() const noexcept { return color_level_; }
-    [[nodiscard]] bool       vt_enabled()  const noexcept { return vt_enabled_; }
+    // ── 접근자 ────────────────────────────────────────────────────────────
+
+    /** @brief 연결된 Terminal 을 반환합니다. */
+    [[nodiscard]] Terminal&       terminal()  noexcept { return term_; }
+    [[nodiscard]] const Terminal& terminal()  const noexcept { return term_; }
+
+    /** @brief 연결된 AnsiScreen 을 반환합니다. */
+    [[nodiscard]] AnsiScreen&       screen()  noexcept { return screen_; }
+    [[nodiscard]] const AnsiScreen& screen()  const noexcept { return screen_; }
+
+    // ── 편의 위임 (Terminal → 자주 쓰는 제어는 렌더러에서도 바로 호출 가능) ──
+
+    /** @brief `Terminal::color_level()` 위임 */
+    [[nodiscard]] ColorLevel color_level() const noexcept { return term_.color_level(); }
+    /** @brief `Terminal::vt_enabled()` 위임 */
+    [[nodiscard]] bool       vt_enabled()  const noexcept { return term_.vt_enabled(); }
 
 private:
     AnsiScreen&   screen_;
+    Terminal&     term_;
     AnsiOptimizer optimizer_;
-    ColorLevel    color_level_ = ColorLevel::TrueColor;
-    bool          vt_enabled_  = false;
-    bool          in_alt_screen_ = false;
-
-#if defined(TERM_PLATFORM_WINDOWS)
-    HANDLE out_handle_ = INVALID_HANDLE_VALUE;
-
-    bool init_windows() {
-        out_handle_ = GetStdHandle(STD_OUTPUT_HANDLE);
-        if (out_handle_ == INVALID_HANDLE_VALUE) return false;  // [MIN-03]
-        DWORD mode = 0;
-        if (!GetConsoleMode(out_handle_, &mode)) return false;
-        mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-        mode |= DISABLE_NEWLINE_AUTO_RETURN;
-        if (!SetConsoleMode(out_handle_, mode)) return false;
-        SetConsoleOutputCP(CP_UTF8);
-        return true;
-    }
-#endif
-
-    void setup() {
-#if defined(TERM_PLATFORM_WINDOWS)
-        vt_enabled_ = init_windows();
-#else
-        vt_enabled_ = true;
-#endif
-    }
-
-    void platform_write(std::string_view data) {
-        if (data.empty()) return;
-#if defined(TERM_PLATFORM_WINDOWS)
-        // [MIN-03] INVALID_HANDLE_VALUE 체크
-        if (vt_enabled_ && out_handle_ != INVALID_HANDLE_VALUE) {
-            DWORD written = 0;
-            WriteFile(out_handle_, data.data(),
-                      static_cast<DWORD>(data.size()), &written, nullptr);
-        }
-#else
-        const char* ptr       = data.data();
-        std::size_t remaining = data.size();
-        while (remaining > 0) {
-            auto written = ::write(STDOUT_FILENO, ptr, remaining);
-            if (written <= 0) break;
-            ptr       += written;
-            remaining -= static_cast<std::size_t>(written);
-        }
-#endif
-    }
 };
 
 } // namespace term

@@ -11,6 +11,7 @@
  *   g++ -std=c++20 -I include myapp.cpp -o myapp
  */
 #include "platform.hpp"
+#include "term_info.hpp"
 #include "util.hpp"
 #include "unicode_width_table.hpp"
 #include "unicode_grapheme_table.hpp"
@@ -21,4 +22,5 @@
 #include "ansi_renderer.hpp"
 #include "spinner.hpp"
 #include "ansi_tui.hpp"
+#include "ansi_tui_dlg.hpp"
 #include "input.hpp"

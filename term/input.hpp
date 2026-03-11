@@ -1,24 +1,59 @@
 #pragma once
 /**
- * input.hpp — 키 입력 플랫폼 추상화  (TDD §10)
+ * @file input.hpp
+ * @brief 키 입력 플랫폼 추상화 (TDD §10)
  *
  * 플랫폼별 키 입력을 공통 KeyEvent 구조체로 정규화한다.
  * 상위 레이어는 플랫폼을 인식하지 않는다.
+ *
+ * ## 수정 이력
+ * - [BUG-1] Windows: VK_F10 → KEY_F10 수정, VK_MENU → KEY_MENU 추가
+ * - [BUG-2] Windows: MOUSE_EVENT 미처리 → translate_mouse() 추가
+ * - [BUG-3] POSIX: SIGWINCH signal() → sigaction(SA_RESTART) 변경
+ * - [BUG-4] POSIX: 0x08(Ctrl+H) Backspace 처리 추가
+ * - [NOTE]  SIGWINCH 핸들러: PosixInput 과 Terminal::on_resize() 를 동시에
+ *           사용하면 핸들러가 덮어써진다. 둘 중 하나만 사용할 것.
+ *           - InputDriver + KEY_RESIZE 이벤트로 처리하거나
+ *           - Terminal::on_resize() + poll_resize() 로 처리할 것.
  */
 
 #include <cstdint>
 #include <memory>
+#include <string>
+
+// ── 플랫폼 헤더 ───────────────────────────────────────────────────────────
+#if defined(_WIN32) || defined(_WIN64)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#else
+#  include <atomic>
+#  include <csignal>
+#  include <cstring>
+#  include <unistd.h>
+#  include <termios.h>
+#  include <sys/ioctl.h>
+#endif
 
 namespace term {
 
-// ═══════════════════════════════════════════════════════════════════════
-//  내부 키 코드 (플랫폼 독립)
-// ═══════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
+//  Key 코드 열거 (플랫폼 독립)
+// ═══════════════════════════════════════════════════════════════════════════
 
+/**
+ * @enum Key
+ * @brief 플랫폼 독립적인 키 코드.
+ * ASCII 출력 가능 문자는 해당 코드포인트를 직접 사용한다.
+ */
 enum Key : uint32_t {
     KEY_NONE      = 0,
 
-    // ── 이동 / 편집 키 ──────────────────────────────────────────────
+    // ── 이동 / 편집 키 ──────────────────────────────────────────────────
     KEY_UP        = 0x1000,
     KEY_DOWN,
     KEY_LEFT,
@@ -34,50 +69,40 @@ enum Key : uint32_t {
     KEY_TAB,
     KEY_ESC,
 
-    // ── 펑션 키 ────────────────────────────────────────────────────
+    // ── 펑션 키 ─────────────────────────────────────────────────────────
     KEY_F1  = 0x1100,
     KEY_F2,  KEY_F3,  KEY_F4,  KEY_F5,
     KEY_F6,  KEY_F7,  KEY_F8,  KEY_F9,
     KEY_F10, KEY_F11, KEY_F12,
-    KEY_MENU,   ///< F10 / Alt+F 메뉴 키
+    KEY_MENU,   ///< 메뉴/애플리케이션 키 (VK_MENU / Alt 단독)
 
-    // ── Ctrl + 알파벳 키 ─────────────────────────────────────────────
-    // Ctrl+H(Backspace)/I(Tab)/J,M(Enter) 은 위에서 처리됨
-    KEY_CTRL_A = 0x1200,  ///< Ctrl+A  (0x01) — 전체선택 / 행 시작
-    KEY_CTRL_B,           ///< Ctrl+B  (0x02)
-    KEY_CTRL_C,           ///< Ctrl+C  (0x03) — 복사 / 인터럽트
-    KEY_CTRL_D,           ///< Ctrl+D  (0x04) — EOF / 삭제
-    KEY_CTRL_E,           ///< Ctrl+E  (0x05) — 행 끝
-    KEY_CTRL_F,           ///< Ctrl+F  (0x06) — 찾기
-    KEY_CTRL_G,           ///< Ctrl+G  (0x07) — 취소
-    KEY_CTRL_K,           ///< Ctrl+K  (0x0B) — 행 뒤 삭제
-    KEY_CTRL_L,           ///< Ctrl+L  (0x0C) — 화면 갱신
-    KEY_CTRL_N,           ///< Ctrl+N  (0x0E) — 다음 줄
-    KEY_CTRL_O,           ///< Ctrl+O  (0x0F) — 열기
-    KEY_CTRL_P,           ///< Ctrl+P  (0x10) — 이전 줄
-    KEY_CTRL_Q,           ///< Ctrl+Q  (0x11) — 종료
-    KEY_CTRL_R,           ///< Ctrl+R  (0x12) — 바꾸기
-    KEY_CTRL_S,           ///< Ctrl+S  (0x13) — 저장
-    KEY_CTRL_T,           ///< Ctrl+T  (0x14) — 전치
-    KEY_CTRL_U,           ///< Ctrl+U  (0x15) — 행 앞 삭제
-    KEY_CTRL_V,           ///< Ctrl+V  (0x16) — 붙여넣기
-    KEY_CTRL_W,           ///< Ctrl+W  (0x17) — 단어 삭제
-    KEY_CTRL_X,           ///< Ctrl+X  (0x18) — 잘라내기
-    KEY_CTRL_Y,           ///< Ctrl+Y  (0x19) — 재실행
-    KEY_CTRL_Z,           ///< Ctrl+Z  (0x1A) — 실행취소
+    // ── Ctrl + 알파벳 ────────────────────────────────────────────────────
+    // Ctrl+H(0x08)/I(Tab)/J(LF)/M(CR) 은 각각 BACKSPACE/TAB/ENTER 로 처리
+    KEY_CTRL_A = 0x1200,
+    KEY_CTRL_B, KEY_CTRL_C, KEY_CTRL_D, KEY_CTRL_E,
+    KEY_CTRL_F, KEY_CTRL_G,
+    KEY_CTRL_K, KEY_CTRL_L, KEY_CTRL_N, KEY_CTRL_O,
+    KEY_CTRL_P, KEY_CTRL_Q, KEY_CTRL_R, KEY_CTRL_S,
+    KEY_CTRL_T, KEY_CTRL_U, KEY_CTRL_V, KEY_CTRL_W,
+    KEY_CTRL_X, KEY_CTRL_Y, KEY_CTRL_Z,
 
-    // ── 시스템 이벤트 ───────────────────────────────────────────────
-    KEY_RESIZE  = 0x1300,  ///< 터미널 리사이즈 이벤트 (SIGWINCH)
-    KEY_MOUSE   = 0x1400,  ///< 마우스 이벤트 (MouseEvent 참조)
+    // ── 시스템 이벤트 ────────────────────────────────────────────────────
+    KEY_RESIZE  = 0x1300,   ///< 터미널 크기 변경 (SIGWINCH / WINDOW_BUFFER_SIZE_EVENT)
+    KEY_MOUSE   = 0x1400,   ///< 마우스 이벤트 → KeyEvent::mouse 참조
 };
 
-/// Ctrl 바이트(0x01~0x1A) → KEY_CTRL_X  변환 (Backspace/Tab/Enter 제외)
+/**
+ * @brief Ctrl 바이트(0x01~0x1A) → KEY_CTRL_* 변환.
+ * 0x08(Ctrl+H/Backspace), 0x09(Tab), 0x0A/0x0D(Enter) 는 KEY_NONE 반환.
+ * 호출자가 parse_ctrl() 에서 별도 처리한다.
+ */
 constexpr uint32_t ctrl_to_key(unsigned char c) noexcept {
     switch (c) {
         case 0x01: return KEY_CTRL_A;  case 0x02: return KEY_CTRL_B;
         case 0x03: return KEY_CTRL_C;  case 0x04: return KEY_CTRL_D;
         case 0x05: return KEY_CTRL_E;  case 0x06: return KEY_CTRL_F;
         case 0x07: return KEY_CTRL_G;
+        // 0x08(Backspace), 0x09(Tab), 0x0A(LF), 0x0D(CR) — parse_ctrl 에서 처리
         case 0x0B: return KEY_CTRL_K;  case 0x0C: return KEY_CTRL_L;
         case 0x0E: return KEY_CTRL_N;  case 0x0F: return KEY_CTRL_O;
         case 0x10: return KEY_CTRL_P;  case 0x11: return KEY_CTRL_Q;
@@ -90,9 +115,9 @@ constexpr uint32_t ctrl_to_key(unsigned char c) noexcept {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-//  수정자 (비트 OR)
-// ═══════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
+//  수정자 플래그
+// ═══════════════════════════════════════════════════════════════════════════
 
 struct Modifier {
     static constexpr uint8_t NONE  = 0;
@@ -101,9 +126,9 @@ struct Modifier {
     static constexpr uint8_t SHIFT = 1 << 2;
 };
 
-// ═══════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
 //  MouseEvent
-// ═══════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
 
 enum class MouseBtn : uint8_t {
     LEFT       = 0,
@@ -116,20 +141,20 @@ enum class MouseBtn : uint8_t {
 
 struct MouseEvent {
     MouseBtn btn    = MouseBtn::LEFT;
-    int      x      = 0;
-    int      y      = 0;
+    int      x      = 0;   ///< 열 (1-based)
+    int      y      = 0;   ///< 행 (1-based)
     bool     motion = false;
 };
 
-// ═══════════════════════════════════════════════════════════════════════
-//  KeyEvent — 모든 필드에 기본값 → 불완전 초기화 경고 없음
-// ═══════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
+//  KeyEvent
+// ═══════════════════════════════════════════════════════════════════════════
 
 struct KeyEvent {
     uint32_t   key      = KEY_NONE;
     uint8_t    modifier = Modifier::NONE;
-    char32_t   ch       = 0;
-    MouseEvent mouse    = {};
+    char32_t   ch       = 0;       ///< 출력 가능 문자 (UTF-32), 0이면 없음
+    MouseEvent mouse    = {};      ///< key==KEY_MOUSE 일 때 유효
 
     bool is_printable() const noexcept { return ch >= 0x20 && ch != 0x7F; }
     bool has_ctrl()     const noexcept { return (modifier & Modifier::CTRL)  != 0; }
@@ -137,29 +162,587 @@ struct KeyEvent {
     bool has_shift()    const noexcept { return (modifier & Modifier::SHIFT) != 0; }
 };
 
-// ═══════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
 //  InputDriver 추상 인터페이스
-// ═══════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
 
 class InputDriver {
 public:
     virtual ~InputDriver() = default;
-    virtual KeyEvent read_key() = 0;
     virtual void     setup()    {}
     virtual void     teardown() {}
+    virtual KeyEvent read_key() = 0;
 };
 
-std::unique_ptr<InputDriver> make_input_driver();
+// ═══════════════════════════════════════════════════════════════════════════
+//  플랫폼별 구현
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ───────────────────────────────────────────────────────────────────────────
+//  Windows 구현
+// ───────────────────────────────────────────────────────────────────────────
+#if defined(_WIN32) || defined(_WIN64)
+
+/**
+ * @class WindowsInput
+ * @brief Windows 콘솔 입력 드라이버 (ReadConsoleInputW)
+ */
+class WindowsInput : public InputDriver {
+public:
+    WindowsInput()  = default;
+    ~WindowsInput() override { teardown(); }
+
+    /**
+     * @brief 콘솔 입력 모드 설정.
+     * ENABLE_WINDOW_INPUT, ENABLE_MOUSE_INPUT 활성화.
+     * ENABLE_PROCESSED_INPUT 비활성화(Ctrl+C 직접 수신).
+     */
+    void setup() override {
+        stdin_handle_ = GetStdHandle(STD_INPUT_HANDLE);
+        GetConsoleMode(stdin_handle_, &orig_mode_);
+        DWORD mode = ENABLE_WINDOW_INPUT | ENABLE_MOUSE_INPUT;
+        SetConsoleMode(stdin_handle_, mode);
+        SetConsoleOutputCP(CP_UTF8);
+        SetConsoleCP(CP_UTF8);
+    }
+
+    void teardown() override {
+        if (stdin_handle_ != INVALID_HANDLE_VALUE)
+            SetConsoleMode(stdin_handle_, orig_mode_);
+    }
+
+    /**
+     * @brief 키/마우스/리사이즈 이벤트를 블로킹 수신.
+     *
+     * 처리 이벤트:
+     * - KEY_EVENT            → translate_key()
+     * - MOUSE_EVENT          → translate_mouse()  [BUG-2 수정]
+     * - WINDOW_BUFFER_SIZE_EVENT → KEY_RESIZE
+     */
+    KeyEvent read_key() override {
+        INPUT_RECORD rec{};
+        DWORD n = 0;
+        while (true) {
+            ReadConsoleInputW(stdin_handle_, &rec, 1, &n);
+
+            if (rec.EventType == KEY_EVENT &&
+                rec.Event.KeyEvent.bKeyDown)
+                return translate_key(rec.Event.KeyEvent);
+
+            // [BUG-2 수정] MOUSE_EVENT 처리 — 기존에 누락되어 이벤트가 소멸됨
+            if (rec.EventType == MOUSE_EVENT)
+                return translate_mouse(rec.Event.MouseEvent);
+
+            if (rec.EventType == WINDOW_BUFFER_SIZE_EVENT) {
+                KeyEvent ke;
+                ke.key = KEY_RESIZE;
+                return ke;
+            }
+        }
+    }
+
+private:
+    HANDLE stdin_handle_ = INVALID_HANDLE_VALUE;
+    DWORD  orig_mode_    = 0;
+
+    // ── 키 변환 ─────────────────────────────────────────────────────────
+
+    KeyEvent translate_key(const KEY_EVENT_RECORD& ke) {
+        uint8_t mod = Modifier::NONE;
+        DWORD   state = ke.dwControlKeyState;
+        if (state & (LEFT_CTRL_PRESSED  | RIGHT_CTRL_PRESSED)) mod |= Modifier::CTRL;
+        if (state & (LEFT_ALT_PRESSED   | RIGHT_ALT_PRESSED))  mod |= Modifier::ALT;
+        if (state & SHIFT_PRESSED)                              mod |= Modifier::SHIFT;
+
+        auto kev = [&](uint32_t k) {
+            KeyEvent e; e.key = k; e.modifier = mod; return e;
+        };
+        auto kev_ch = [&](uint32_t k, char32_t c) {
+            KeyEvent e; e.key = k; e.modifier = mod; e.ch = c; return e;
+        };
+
+        WORD vk = ke.wVirtualKeyCode;
+        switch (vk) {
+            case VK_UP:     return kev(KEY_UP);
+            case VK_DOWN:   return kev(KEY_DOWN);
+            case VK_LEFT:   return kev(KEY_LEFT);
+            case VK_RIGHT:  return kev(KEY_RIGHT);
+            case VK_HOME:   return kev(KEY_HOME);
+            case VK_END:    return kev(KEY_END);
+            case VK_PRIOR:  return kev(KEY_PGUP);
+            case VK_NEXT:   return kev(KEY_PGDN);
+            case VK_INSERT: return kev(KEY_INS);
+            case VK_DELETE: return kev(KEY_DEL);
+            case VK_BACK:   return kev(KEY_BACKSPACE);
+            case VK_RETURN: return kev_ch(KEY_ENTER, U'\n');
+            case VK_TAB:    return kev_ch(KEY_TAB,   U'\t');
+            case VK_ESCAPE: return kev(KEY_ESC);
+            case VK_F1:     return kev(KEY_F1);
+            case VK_F2:     return kev(KEY_F2);
+            case VK_F3:     return kev(KEY_F3);
+            case VK_F4:     return kev(KEY_F4);
+            case VK_F5:     return kev(KEY_F5);
+            case VK_F6:     return kev(KEY_F6);
+            case VK_F7:     return kev(KEY_F7);
+            case VK_F8:     return kev(KEY_F8);
+            case VK_F9:     return kev(KEY_F9);
+            // [BUG-1 수정] VK_F10 → KEY_F10 (기존: KEY_MENU 오매핑)
+            case VK_F10:    return kev(KEY_F10);
+            case VK_F11:    return kev(KEY_F11);
+            case VK_F12:    return kev(KEY_F12);
+            // [BUG-1 수정] VK_MENU(Alt 단독) → KEY_MENU 추가
+            case VK_MENU:   return kev(KEY_MENU);
+            default: break;
+        }
+
+        // Ctrl + 알파벳 → KEY_CTRL_*
+        if (mod & Modifier::CTRL) {
+            if (vk >= 'A' && vk <= 'Z') {
+                unsigned char ctrl_byte = static_cast<unsigned char>(vk - 'A' + 1);
+                uint32_t k = ctrl_to_key(ctrl_byte);
+                if (k != KEY_NONE) return kev(k);
+            }
+        }
+
+        // 일반 문자 (UnicodeChar)
+        wchar_t wc = ke.uChar.UnicodeChar;
+        if (wc >= 0x20) {
+            char32_t cp = static_cast<char32_t>(wc);
+            KeyEvent e;
+            e.key      = static_cast<uint32_t>(cp);
+            e.modifier = mod;
+            e.ch       = cp;
+            return e;
+        }
+
+        return KeyEvent{};  // KEY_NONE
+    }
+
+    // ── 마우스 변환 [BUG-2 수정] ────────────────────────────────────────
+
+    /**
+     * @brief MOUSE_EVENT_RECORD → KeyEvent(KEY_MOUSE) 변환.
+     *
+     * 버튼 매핑:
+     * - FROM_LEFT_1ST_BUTTON_PRESSED → LEFT
+     * - RIGHTMOST_BUTTON_PRESSED     → RIGHT
+     * - FROM_LEFT_2ND_BUTTON_PRESSED → MIDDLE
+     * - MOUSE_WHEELED (양수)         → WHEEL_UP
+     * - MOUSE_WHEELED (음수)         → WHEEL_DOWN
+     * - 버튼 없음                    → RELEASE
+     */
+    KeyEvent translate_mouse(const MOUSE_EVENT_RECORD& mr) {
+        MouseEvent me;
+        // Windows 좌표는 0-based, SGR은 1-based 로 맞춤
+        me.x      = mr.dwMousePosition.X + 1;
+        me.y      = mr.dwMousePosition.Y + 1;
+        me.motion = (mr.dwEventFlags & MOUSE_MOVED) != 0;
+
+        if (mr.dwEventFlags & MOUSE_WHEELED) {
+            // 상위 16비트가 델타값: 양수=위, 음수=아래
+            SHORT delta = static_cast<SHORT>(HIWORD(mr.dwButtonState));
+            me.btn = (delta > 0) ? MouseBtn::WHEEL_UP : MouseBtn::WHEEL_DOWN;
+        } else if (mr.dwButtonState & FROM_LEFT_1ST_BUTTON_PRESSED) {
+            me.btn = MouseBtn::LEFT;
+        } else if (mr.dwButtonState & RIGHTMOST_BUTTON_PRESSED) {
+            me.btn = MouseBtn::RIGHT;
+        } else if (mr.dwButtonState & FROM_LEFT_2ND_BUTTON_PRESSED) {
+            me.btn = MouseBtn::MIDDLE;
+        } else {
+            me.btn = MouseBtn::RELEASE;
+        }
+
+        KeyEvent ke;
+        ke.key   = KEY_MOUSE;
+        ke.mouse = me;
+        return ke;
+    }
+};
+
+// ───────────────────────────────────────────────────────────────────────────
+//  POSIX 구현 (Linux / macOS)
+// ───────────────────────────────────────────────────────────────────────────
+#else
+
+/// 마우스 추적 활성/비활성 시퀀스 (xterm SGR 마우스 프로토콜)
+static constexpr char MOUSE_ON[]  = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+static constexpr char MOUSE_OFF[] = "\x1b[?1000l\x1b[?1002l\x1b[?1006l";
+
+namespace input_detail {
+/// SIGWINCH 수신 플래그 — signal handler 안에서만 쓰이므로 atomic
+inline std::atomic<bool> g_sigwinch_flag{false};
+
+/// [BUG-3 수정] signal() → sigaction(SA_RESTART) 으로 변경
+/// SA_RESTART: SIGWINCH 수신 시 read() 등 slow syscall 을 자동 재시작
+inline void install_sigwinch_handler() {
+    struct sigaction sa{};
+    sa.sa_handler = [](int) noexcept { g_sigwinch_flag.store(true); };
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    ::sigaction(SIGWINCH, &sa, nullptr);
+}
+} // namespace input_detail
+
+// 편의 매크로 (함수 내부에서만 사용, 파일 하단에서 해제)
+#define TERM_KEV(k_)             KeyEvent{ .key=(k_) }
+#define TERM_KEV_M(k_, m_)       KeyEvent{ .key=(k_), .modifier=(m_) }
+#define TERM_KEV_CH(k_, m_, c_)  KeyEvent{ .key=(k_), .modifier=(m_), .ch=(c_) }
+
+/**
+ * @class PosixInput
+ * @brief POSIX 터미널 입력 드라이버 (termios raw 모드 + ESC 시퀀스 파싱)
+ *
+ * ## Raw mode 설정
+ * - VMIN=1, VTIME=0: read() 가 최소 1바이트가 올 때까지 블로킹
+ * - ISIG 비활성화: Ctrl+C/Z 를 시그널로 올리지 않고 이벤트로 전달
+ *
+ * ## Terminal::enter_raw_mode() 와 동시 사용 금지
+ * PosixInput::setup() 이 직접 termios 를 설정하므로
+ * Terminal::enter_raw_mode() 와 동시에 사용하면 복원 순서가 꼬입니다.
+ * 둘 중 하나만 사용하세요.
+ *
+ * ## SIGWINCH 처리
+ * PosixInput::setup() 이 SIGWINCH 핸들러를 등록합니다.
+ * Terminal::on_resize() 와 동시에 사용하면 핸들러가 덮어써집니다.
+ * 리사이즈는 read_key() → KEY_RESIZE 이벤트로 처리하거나,
+ * Terminal::on_resize() + poll_resize() 로 처리하세요 (둘 중 하나만).
+ */
+class PosixInput : public InputDriver {
+public:
+    PosixInput()  = default;
+    ~PosixInput() override { teardown(); }
+
+    /**
+     * @brief 터미널 raw 모드 전환 + 마우스 추적 활성화 + SIGWINCH 등록.
+     */
+    void setup() override {
+        if (raw_active_) return;
+        tcgetattr(STDIN_FILENO, &orig_);
+        struct termios raw = orig_;
+        raw.c_iflag &= ~static_cast<tcflag_t>(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+        raw.c_oflag &= ~static_cast<tcflag_t>(OPOST);
+        raw.c_cflag |=  static_cast<tcflag_t>(CS8);
+        raw.c_lflag &= ~static_cast<tcflag_t>(ECHO | ICANON | IEXTEN | ISIG);
+        raw.c_cc[VMIN]  = 1;   // 최소 1바이트 수신 후 반환 (blocking)
+        raw.c_cc[VTIME] = 0;   // 타임아웃 없음
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+        raw_active_ = true;
+
+        // [BUG-3 수정] sigaction + SA_RESTART (기존: signal() 사용)
+        input_detail::install_sigwinch_handler();
+
+        // 마우스 추적 활성화 (xterm SGR 프로토콜)
+        { auto r = ::write(STDOUT_FILENO, MOUSE_ON, sizeof(MOUSE_ON) - 1); (void)r; }
+    }
+
+    /**
+     * @brief 터미널 원상 복원 + 마우스 추적 비활성화.
+     */
+    void teardown() override {
+        if (!raw_active_) return;
+        { auto r = ::write(STDOUT_FILENO, MOUSE_OFF, sizeof(MOUSE_OFF) - 1); (void)r; }
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_);
+        raw_active_ = false;
+    }
+
+    /**
+     * @brief 키/마우스/리사이즈 이벤트를 블로킹 수신.
+     *
+     * 처리 순서:
+     * 1. SIGWINCH 플래그 → KEY_RESIZE
+     * 2. 1바이트 read
+     * 3. ESC(0x1B)           → parse_escape()
+     * 4. 제어 문자 / DEL     → parse_ctrl()
+     * 5. 그 외 UTF-8 바이트  → parse_utf8()
+     */
+    KeyEvent read_key() override {
+        // SIGWINCH 플래그 확인 (atomic exchange → false 로 초기화)
+        if (input_detail::g_sigwinch_flag.exchange(false))
+            return TERM_KEV(KEY_RESIZE);
+
+        unsigned char c = 0;
+        if (::read(STDIN_FILENO, &c, 1) <= 0)
+            return TERM_KEV(KEY_NONE);
+
+        if (c == 0x1B)             return parse_escape();
+        if (c < 0x20 || c == 0x7F) return parse_ctrl(c);
+        return parse_utf8(c);
+    }
+
+private:
+    termios orig_{};
+    bool    raw_active_ = false;
+
+    // ── 타임아웃 읽기 ───────────────────────────────────────────────────
+
+    /**
+     * @brief 지정 시간 동안 1바이트를 시도적으로 읽는다.
+     *
+     * ESC 시퀀스 연속 바이트 판별에 사용.
+     * VMIN=0, VTIME=timeout_ms/100 으로 임시 설정 후 복원한다.
+     *
+     * @param out   읽은 바이트 저장 대상
+     * @param timeout_ms 최대 대기 시간 (ms, 기본 100ms)
+     * @return 읽은 바이트 수 (0=타임아웃, -1=오류)
+     */
+    int read_timeout(unsigned char& out, int timeout_ms = 100) {
+        struct termios t, tmp;
+        tcgetattr(STDIN_FILENO, &t);
+        tmp = t;
+        tmp.c_cc[VMIN]  = 0;
+        tmp.c_cc[VTIME] = static_cast<cc_t>(timeout_ms / 100);
+        tcsetattr(STDIN_FILENO, TCSANOW, &tmp);
+        int n = static_cast<int>(::read(STDIN_FILENO, &out, 1));
+        tcsetattr(STDIN_FILENO, TCSANOW, &t);
+        return n;
+    }
+
+    // ── ESC 시퀀스 파싱 ─────────────────────────────────────────────────
+
+    /**
+     * @brief ESC(0x1B) 시작 시퀀스 파싱.
+     *
+     * - 100ms 안에 다음 바이트 없음 → KEY_ESC (단독 ESC)
+     * - ESC [   → parse_csi()     (방향키, Fn, 마우스 등)
+     * - ESC O   → SS3 시퀀스     (F1-F4, Home, End — 일부 터미널)
+     * - ESC <문자> → Alt + 문자
+     */
+    KeyEvent parse_escape() {
+        unsigned char c2 = 0;
+        if (read_timeout(c2) <= 0)
+            return TERM_KEV(KEY_ESC);   // 단독 ESC
+
+        if (c2 == '[') return parse_csi();
+
+        if (c2 == 'O') {
+            unsigned char c3 = 0;
+            if (read_timeout(c3) > 0) {
+                switch (c3) {
+                    case 'P': return TERM_KEV(KEY_F1);
+                    case 'Q': return TERM_KEV(KEY_F2);
+                    case 'R': return TERM_KEV(KEY_F3);
+                    case 'S': return TERM_KEV(KEY_F4);
+                    case 'H': return TERM_KEV(KEY_HOME);
+                    case 'F': return TERM_KEV(KEY_END);
+                    default:  break;
+                }
+            }
+        }
+
+        // Alt + 출력 가능 문자
+        if (c2 >= 0x20 && c2 < 0x7F)
+            return TERM_KEV_CH(static_cast<uint32_t>(c2),
+                               Modifier::ALT,
+                               static_cast<char32_t>(c2));
+
+        return TERM_KEV(KEY_ESC);
+    }
+
+    /**
+     * @brief CSI (ESC [) 시퀀스 파싱.
+     *
+     * 지원 형식:
+     * - ESC [ A/B/C/D           → 방향키 (± 수정자)
+     * - ESC [ H/F               → Home / End
+     * - ESC [ P/Q/R/S           → F1-F4
+     * - ESC [ 1;Mod A …         → 수정자 포함 방향키
+     * - ESC [ num ~             → Insert/Delete/PgUp/PgDn/Fn
+     * - ESC [ < Cb;Cx;Cy M/m   → SGR 마우스 프로토콜
+     */
+    KeyEvent parse_csi() {
+        char buf[32]{};
+        int  len = 0;
+        unsigned char c = 0;
+
+        while (len < 31 && read_timeout(c) > 0) {
+            buf[len++] = static_cast<char>(c);
+            if (c >= 0x40 && c <= 0x7E) break;   // 최종 바이트 도달
+        }
+        if (len == 0) return TERM_KEV(KEY_ESC);
+
+        char        final_ch = buf[len - 1];
+        std::string params(buf, static_cast<std::size_t>(len - 1));
+
+        // ── SGR 마우스: ESC [ < Cb;Cx;Cy M/m ───────────────────────────
+        if (!params.empty() && params[0] == '<') {
+            std::string p = params.substr(1);
+            int cb = 0, cx = 0, cy = 0;
+            auto p1 = p.find(';');
+            auto p2 = (p1 != std::string::npos)
+                          ? p.find(';', p1 + 1)
+                          : std::string::npos;
+            if (p1 != std::string::npos && p2 != std::string::npos) {
+                cb = std::stoi(p.substr(0, p1));
+                cx = std::stoi(p.substr(p1 + 1, p2 - p1 - 1));
+                cy = std::stoi(p.substr(p2 + 1));
+            }
+
+            MouseEvent me;
+            me.x      = cx;
+            me.y      = cy;
+            me.motion = (cb & 32) != 0;
+            int btn_raw = cb & ~32;
+
+            if      (btn_raw == 64)   me.btn = MouseBtn::WHEEL_UP;
+            else if (btn_raw == 65)   me.btn = MouseBtn::WHEEL_DOWN;
+            else if (final_ch == 'm') me.btn = MouseBtn::RELEASE;
+            else {
+                switch (btn_raw & 3) {
+                    case 0:  me.btn = MouseBtn::LEFT;    break;
+                    case 1:  me.btn = MouseBtn::MIDDLE;  break;
+                    case 2:  me.btn = MouseBtn::RIGHT;   break;
+                    default: me.btn = MouseBtn::RELEASE; break;
+                }
+            }
+
+            KeyEvent ke;
+            ke.key   = KEY_MOUSE;
+            ke.mouse = me;
+            return ke;
+        }
+
+        // ── 수정자 비트 파싱 (xterm: 1;Mod 형식) ────────────────────────
+        uint8_t mod  = Modifier::NONE;
+        auto    semi = params.find(';');
+        if (semi != std::string::npos) {
+            int mod_num = std::stoi(params.substr(semi + 1)) - 1;
+            if (mod_num & 1) mod |= Modifier::SHIFT;
+            if (mod_num & 2) mod |= Modifier::ALT;
+            if (mod_num & 4) mod |= Modifier::CTRL;
+            params = params.substr(0, semi);
+        }
+        int num = params.empty() ? 1 : std::stoi(params);
+
+        switch (final_ch) {
+            case 'A': return TERM_KEV_M(KEY_UP,    mod);
+            case 'B': return TERM_KEV_M(KEY_DOWN,  mod);
+            case 'C': return TERM_KEV_M(KEY_RIGHT, mod);
+            case 'D': return TERM_KEV_M(KEY_LEFT,  mod);
+            case 'H': return TERM_KEV_M(KEY_HOME,  mod);
+            case 'F': return TERM_KEV_M(KEY_END,   mod);
+            case 'P': return TERM_KEV_M(KEY_F1,    mod);
+            case 'Q': return TERM_KEV_M(KEY_F2,    mod);
+            case 'R': return TERM_KEV_M(KEY_F3,    mod);
+            case 'S': return TERM_KEV_M(KEY_F4,    mod);
+            case '~':
+                switch (num) {
+                    case 1:  return TERM_KEV_M(KEY_HOME, mod);
+                    case 2:  return TERM_KEV_M(KEY_INS,  mod);
+                    case 3:  return TERM_KEV_M(KEY_DEL,  mod);
+                    case 4:  return TERM_KEV_M(KEY_END,  mod);
+                    case 5:  return TERM_KEV_M(KEY_PGUP, mod);
+                    case 6:  return TERM_KEV_M(KEY_PGDN, mod);
+                    case 11: return TERM_KEV_M(KEY_F1,   mod);
+                    case 12: return TERM_KEV_M(KEY_F2,   mod);
+                    case 13: return TERM_KEV_M(KEY_F3,   mod);
+                    case 14: return TERM_KEV_M(KEY_F4,   mod);
+                    case 15: return TERM_KEV_M(KEY_F5,   mod);
+                    case 17: return TERM_KEV_M(KEY_F6,   mod);
+                    case 18: return TERM_KEV_M(KEY_F7,   mod);
+                    case 19: return TERM_KEV_M(KEY_F8,   mod);
+                    case 20: return TERM_KEV_M(KEY_F9,   mod);
+                    case 21: return TERM_KEV_M(KEY_F10,  mod);
+                    case 23: return TERM_KEV_M(KEY_F11,  mod);
+                    case 24: return TERM_KEV_M(KEY_F12,  mod);
+                    default: break;
+                }
+                break;
+            default: break;
+        }
+        return TERM_KEV(KEY_NONE);
+    }
+
+    // ── 제어 문자 파싱 ──────────────────────────────────────────────────
+
+    /**
+     * @brief 제어 문자(0x00~0x1F) 및 DEL(0x7F) 파싱.
+     *
+     * - 0x7F, 0x08 → KEY_BACKSPACE  [BUG-4 수정: 0x08 추가]
+     *   0x08 = Ctrl+H, 구형 VT100 / 일부 SSH 환경에서 Backspace 로 사용
+     * - 0x0D, 0x0A → KEY_ENTER
+     * - 0x09       → KEY_TAB
+     * - 그 외      → ctrl_to_key() → KEY_CTRL_*
+     */
+    KeyEvent parse_ctrl(unsigned char c) {
+        // [BUG-4 수정] 0x08(Ctrl+H) 도 Backspace 로 처리
+        if (c == 0x7F || c == 0x08)
+            return TERM_KEV(KEY_BACKSPACE);
+        if (c == 0x0D || c == 0x0A)
+            return TERM_KEV_CH(KEY_ENTER, Modifier::NONE, U'\n');
+        if (c == 0x09)
+            return TERM_KEV_CH(KEY_TAB,   Modifier::NONE, U'\t');
+
+        uint32_t k = ctrl_to_key(c);
+        if (k != KEY_NONE)
+            return TERM_KEV_M(k, Modifier::CTRL);
+
+        // ctrl_to_key() 에서 매핑되지 않은 제어 코드 — 문자로 fallback
+        char32_t letter = static_cast<char32_t>(c + 0x40);
+        return TERM_KEV_CH(static_cast<uint32_t>(letter), Modifier::CTRL, letter);
+    }
+
+    // ── UTF-8 파싱 ──────────────────────────────────────────────────────
+
+    /**
+     * @brief UTF-8 멀티바이트 시퀀스를 읽어 단일 코드포인트로 변환.
+     *
+     * 첫 바이트로 시퀀스 길이를 결정하고 나머지 바이트를 read() 로 추가 수신.
+     * 잘린 시퀀스(read 실패)는 수신된 바이트까지만 처리한다.
+     *
+     * @param c 이미 읽은 첫 번째 바이트
+     */
+    KeyEvent parse_utf8(unsigned char c) {
+        char buf[4] = { static_cast<char>(c), 0, 0, 0 };
+        int  seq_len = 1;
+        if      ((c & 0xE0) == 0xC0) seq_len = 2;
+        else if ((c & 0xF0) == 0xE0) seq_len = 3;
+        else if ((c & 0xF8) == 0xF0) seq_len = 4;
+
+        for (int i = 1; i < seq_len; ++i) {
+            unsigned char b = 0;
+            if (::read(STDIN_FILENO, &b, 1) <= 0) break;
+            buf[i] = static_cast<char>(b);
+        }
+
+        // 바이트 조립 → UTF-32 코드포인트
+        char32_t cp = static_cast<unsigned char>(buf[0]);
+        if (seq_len == 2)
+            cp = ((cp & 0x1F) << 6)
+               | (static_cast<unsigned char>(buf[1]) & 0x3F);
+        else if (seq_len == 3)
+            cp = ((cp & 0x0F) << 12)
+               | ((static_cast<unsigned char>(buf[1]) & 0x3F) << 6)
+               |  (static_cast<unsigned char>(buf[2]) & 0x3F);
+        else if (seq_len == 4)
+            cp = ((cp & 0x07) << 18)
+               | ((static_cast<unsigned char>(buf[1]) & 0x3F) << 12)
+               | ((static_cast<unsigned char>(buf[2]) & 0x3F) << 6)
+               |  (static_cast<unsigned char>(buf[3]) & 0x3F);
+
+        return TERM_KEV_CH(static_cast<uint32_t>(cp), Modifier::NONE, cp);
+    }
+};
+
+#undef TERM_KEV
+#undef TERM_KEV_M
+#undef TERM_KEV_CH
+
+#endif // _WIN32 / POSIX
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  팩토리
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * @brief 플랫폼에 맞는 InputDriver 를 생성한다.
+ * @return unique_ptr<InputDriver>
+ */
+inline std::unique_ptr<InputDriver> make_input_driver() {
+#if defined(_WIN32) || defined(_WIN64)
+    return std::make_unique<WindowsInput>();
+#else
+    return std::make_unique<PosixInput>();
+#endif
+}
 
 } // namespace term
-
-
-// ═══════════════════════════════════════════════════════════════════════
-//  플랫폼별 구현 포함
-// ═══════════════════════════════════════════════════════════════════════
-
-#if defined(_WIN32) || defined(_WIN64)
-#  include "windows_input.hpp"
-#else
-#  include "posix_input.hpp"
-#endif
