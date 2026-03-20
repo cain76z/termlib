@@ -462,6 +462,7 @@ inline void grapheme_cache_insert(std::string_view utf8, std::vector<Grapheme> v
 //  구현부가 모두 클래스 본체 안에 위치한다.
 // ═══════════════════════════════════════════════════════════════════════════
 
+
 /**
  * @brief 유니코드 문자열 처리 유틸리티 클래스
  *
@@ -519,42 +520,99 @@ public:
     [[nodiscard]] std::size_t        size()  const noexcept { return data_.size(); }
 
     /**
-     * @brief 보유 중인 문자열의 터미널 출력 너비를 반환합니다.
-     * @return 터미널 열 단위 너비
+     * @brief 내부적으로 캐싱된 그래핌 클러스터 목록을 반환합니다.
+     * 최초 호출 시에만 분할 연산이 발생하며, 이후에는 O(1) 접근입니다.
+     */
+    [[nodiscard]] const std::vector<Grapheme>& graphemes() const {
+        ensure_analyzed();
+        return graphemes_;
+    }
+
+    /**
+     * @brief 전체 디스플레이 너비를 반환합니다. (캐싱됨)
      */
     [[nodiscard]] int display_width() const {
-        return display_width(data_);
+        ensure_analyzed();
+        return cached_width_;
     }
 
     /**
-     * @brief 보유 중인 문자열을 그래핌 클러스터로 분할합니다.
-     * @return 그래핌 클러스터 벡터
+     * @brief 분할된 그래핌 클러스터의 복사본을 반환합니다.
+     * (API 호환성 유지용, graphemes() 사용 권장)
      */
     [[nodiscard]] std::vector<Grapheme> split() const {
-        return split(data_);
+        ensure_analyzed();
+        return graphemes_; // 복사 발생
     }
 
     /**
-     * @brief 보유 중인 문자열을 최대 너비에 맞게 자릅니다.
-     * @param max_cols 허용할 최대 열 수
-     * @param clip_char 클리핑 표시 문자열 (기본값 빈 문자열)
-     * @return 클리핑된 UTF-8 문자열
+     * @brief 최대 너비에 맞게 문자열을 자릅니다. (캐시 활용)
      */
-    [[nodiscard]] std::string clip(int max_cols,
-                                   std::string_view clip_char = "") const {
-        return clip(data_, max_cols, clip_char);
+    [[nodiscard]] std::string clip(int max_cols, std::string_view clip_char = "") const {
+        if (max_cols <= 0) return {};
+
+        ensure_analyzed(); // 캐시된 클러스터 사용
+
+        int clip_w = clip_char.empty() ? 0 : display_width(clip_char);
+        int budget = max_cols - clip_w;
+        int used = 0;
+        std::string result;
+        result.reserve(data_.size());
+
+        bool clipped = false;
+        for (const auto& g : graphemes_) {
+            if (used + g.width > budget) { clipped = true; break; }
+            result += g.bytes;
+            used += g.width;
+        }
+
+        if (clipped && !clip_char.empty()) {
+            result += clip_char;
+            if (used + clip_w < max_cols) result += ' ';
+        }
+        return result;
     }
 
     /**
-     * @brief 보유 중인 문자열에서 지정된 열 범위를 추출합니다.
-     * @param start 시작 위치 (터미널 열 단위, 0부터)
-     * @param length 추출할 너비 (터미널 열 단위)
-     * @param fill 부족한 너비를 채울 문자 (기본값 ' ')
-     * @return 추출된 UTF-8 문자열
+     * @brief 지정된 열 범위를 추출합니다. (캐시 활용)
      */
-    [[nodiscard]] std::string get_sub_string(int start, int length,
-                                             char fill = ' ') const {
-        return get_sub_string(data_, start, length, fill);
+    [[nodiscard]] std::string get_sub_string(int start, int length, char fill = ' ') const {
+        if (length <= 0) return {};
+
+        ensure_analyzed(); // 캐시된 클러스터 사용
+
+        std::string result;
+        result.reserve(data_.size());
+        int current_col = 0;
+        int added_width = 0;
+
+        for (const auto& g : graphemes_) {
+            if (current_col < start) {
+                if (current_col + g.width > start) {
+                    int overlap = (current_col + g.width) - start;
+                    int to_fill = std::min(overlap, length);
+                    result.append(to_fill, fill);
+                    added_width += to_fill;
+                }
+                current_col += g.width;
+                continue;
+            }
+
+            if (added_width + g.width <= length) {
+                result += g.bytes;
+                added_width += g.width;
+            } else {
+                int remain = length - added_width;
+                if (remain > 0) {
+                    result.append(remain, fill);
+                    added_width += remain;
+                }
+                break;
+            }
+        }
+
+        if (added_width < length) result.append(length - added_width, fill);
+        return result;
     }
 
     // ── 코드포인트 너비 (정적) ───────────────────────────────────────────
@@ -946,6 +1004,29 @@ public:
 
 private:
     std::string data_;  ///< 보유 중인 UTF-8 문자열 (인스턴스 API 전용)
+    // ── 지연 초기화(Lazy Initialization)를 위한 캐시 멤버 ───────────────
+    // mutable: const 메서드(display_width 등)에서도 값을 변경(캐싱)하기 위해 필요
+    mutable std::vector<Grapheme> graphemes_;
+    mutable int  cached_width_ = 0;
+    mutable bool analyzed_     = false;
+
+    /**
+     * @brief 문자열 분할이 필요한 시점에 최초 1회만 실행합니다.
+     */
+    void ensure_analyzed() const {
+        if (TERM_LIKELY(analyzed_)) return;
+
+        // 정적 split 함수를 호출하여 분할 수행 (이때 전역 캐시도 활용됨)
+        // 단, 여기서는 결과를 인스턴스 멤버에 저장하여 영속화합니다.
+        graphemes_ = split(data_);
+
+        // 너비 미리 계산
+        cached_width_ = 0;
+        for (const auto& g : graphemes_) {
+            cached_width_ += g.width;
+        }
+        analyzed_ = true;
+    }
 };
 
 } // namespace term
