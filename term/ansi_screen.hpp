@@ -10,8 +10,8 @@
  *
  * 구현부는 모두 클래스 본체 안에 위치한다.
  */
-#include "uni_string.hpp"
-#include "ansi_string.hpp"
+#include "term/uni_string.hpp"
+#include "term/ansi_string.hpp"
 #include <algorithm>
 #include <cassert>
 #include <cstdint>

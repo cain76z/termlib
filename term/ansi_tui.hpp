@@ -5,10 +5,10 @@
  * 구현부가 모두 클래스 본체 안에 위치한다.
  * KeyEvent 완전 정의가 필요하므로 input.hpp 를 파일 상단에서 include 한다.
  */
-#include "ansi_screen.hpp"
-#include "ansi_string.hpp"
-#include "uni_string.hpp"
-#include "input.hpp"      // KeyEvent, MouseEvent 완전 정의 (구현부에서 필요)
+#include "term/ansi_screen.hpp"
+#include "term/ansi_string.hpp"
+#include "term/uni_string.hpp"
+#include "term/input.hpp"      // KeyEvent, MouseEvent 완전 정의 (구현부에서 필요)
 #include <algorithm>
 #include <cstdio>
 #include <functional>

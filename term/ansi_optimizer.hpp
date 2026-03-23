@@ -4,7 +4,7 @@
  *
  * 구현부가 모두 클래스 본체 안에 위치한다.
  */
-#include "ansi_screen.hpp"
+#include "term/ansi_screen.hpp"
 #include <bit>
 #include <string>
 

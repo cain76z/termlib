@@ -39,3 +39,17 @@
 #  endif
 #  include <windows.h>
 #endif
+
+// ── encode.hpp / console.hpp 호환 별칭 ───────────────────
+// encode.hpp 는 PLATFORM_WINDOWS(0/1) 매크로를 사용한다.
+// platform.hpp 를 먼저 include 하면 아래 별칭이 정의되므로
+// encode.hpp 는 자체 플랫폼 감지 블록을 생략할 수 있다.
+#if defined(TERM_PLATFORM_WINDOWS)
+#  ifndef PLATFORM_WINDOWS
+#    define PLATFORM_WINDOWS 1
+#  endif
+#else
+#  ifndef PLATFORM_WINDOWS
+#    define PLATFORM_WINDOWS 0
+#  endif
+#endif

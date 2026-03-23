@@ -16,36 +16,9 @@
  * 구현부는 모두 클래스 본체 안에 위치한다.
  * 내부 헬퍼(dlg_detail)는 클래스 선언 앞에 배치한다.
  */
-/*
-                      ╚══════════════════════════════════╝
 
-                             데모 항목을 선택하세요
-
-                 [1]  FileOpenDialog  (단일 선택)                 ← 파일 하나 선
-택
-                 [2]  FileOpenDialog  (다중 선택)                 ← Space로 여러
- 파일 선택       [1]  FileOpenDialog  (단일 선택)
-                 [3]  FileSaveDialog                              ← 파일 저장 경
-로 입력          [2]  FileOpenDialog  (다중 선택)
-                 [4]  SelectDialog    (단일)                      ← 목록에서 항
-목 택            [3]  FileSaveDialog
- 선택
-                 [4]  SelectDialog    (단일)                      ← 목록에서 여
-러               [q]  종료                                        ← 프로그램 종
- 항목 선택       [5]  SelectDialog    (다중)
-                 [q]  종료                                        ← 프로그램 종
-료               [q]  종료
-
-
-
-
-
-                    ↑↓ 이동    Enter 실행    숫자 직접 선택    q 종료
-
-
-*/
-#include "ansi_tui.hpp"
-#include "ansi_renderer.hpp"
+#include "term/ansi_tui.hpp"
+#include "term/ansi_renderer.hpp"
 #include <algorithm>
 #include <cassert>
 #include <cstdio>

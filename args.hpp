@@ -64,13 +64,13 @@ struct ArgsParseOptions {
     bool expand_directories  = true;   ///< 디렉토리를 파일 목록으로 자동 전개
 
     // ── 확장자 필터 (점 포함, 소문자, 예: L".cpp") ────────
-    std::vector<std::wstring> include_extensions;  ///< 이 확장자만 포함 (빈 경우 모두 포함)
-    std::vector<std::wstring> exclude_extensions;  ///< 이 확장자는 항상 제외
+    std::vector<std::wstring> include_extensions = {};  ///< 이 확장자만 포함 (빈 경우 모두 포함)
+    std::vector<std::wstring> exclude_extensions = {};  ///< 이 확장자는 항상 제외
 
     // ── 공백 구분 값을 가지는 옵션 목록 ──────────────────
     /// "--output", "--threads" 등을 등록하면 "--output result.txt" 형태로 파싱.
     /// 비어있으면 모든 옵션을 플래그로 처리. "=" 형식은 항상 동작.
-    std::set<std::wstring> value_args;
+    std::set<std::wstring> value_args = {};  ///< 공백 구분 값 허용 옵션 (예: L"--output", L"-o")
 };
 
 // =========================================================
@@ -196,6 +196,8 @@ private:
         for (int i = 1; i < wargc; ++i)
             raw_args_.emplace_back(wargv[i]);
         LocalFree(wargv);
+        (void)argc;  // 사용하지 않음
+        (void)argv;  // 사용하지 않음
 #else
         // Linux/macOS: 시스템 인코딩(보통 UTF-8) → wstring
         std::setlocale(LC_ALL, "");

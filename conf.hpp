@@ -4,7 +4,7 @@
  * ConfReader - 단일 헤더 INI 스타일 설정 파일 리더
  *
  * 사용법:
- *   #include "conf.hpp"   // str.hpp가 같은 경로에 있어야 함
+ *   #include "conf.hpp"
  *
  *   ConfReader conf;                     // 실행파일과 같은 이름의 .conf 자동 탐색
  *   ConfReader conf("C:/app/my.conf");   // 경로 직접 지정
@@ -22,6 +22,8 @@
  *                wav, flac
  *
  *   path = "C:/My Music"        # 따옴표 값 (자동 제거)
+ *
+ * 의존: str.hpp (strutil), fnutil.hpp (fnutil::get_executable_conf)
  */
 
 #include <string>
@@ -31,14 +33,8 @@
 #include <filesystem>
 #include <stdexcept>
 
-#include "str.hpp"   // trim, to_lower, split_comma, strip_comment
-
-#ifdef _WIN32
-#  include <windows.h>
-#else
-#  include <unistd.h>
-#  include <limits.h>
-#endif
+#include "str.hpp"     // strutil::trim, to_lower, split_comma, strip_comment
+#include "fnutil.hpp"  // fnutil::get_executable_conf
 
 // ============================================================
 //  ConfReader
@@ -53,11 +49,12 @@ public:
     // 생성자
     // ----------------------------------------------------------
 
-    /// 실행파일과 같은 경로에서 확장자만 .conf 로 바꿔 읽음
+    /// 실행파일명.conf 자동 탐색 (fnutil::get_executable_conf 사용)
     explicit ConfReader(bool throwOnMissing = false)
         : m_throwOnMissing(throwOnMissing)
     {
-        load(executableConfPath());
+        auto path = fnutil::get_executable_conf("conf");
+        load(path.empty() ? "app.conf" : path.string());
     }
 
     /// 파일 경로 직접 지정
@@ -72,13 +69,15 @@ public:
     // ----------------------------------------------------------
 
     /// [section] key 조회. 루트 키는 section = ConfReader::ROOT ("")
+    /// 주의: defaultValue 는 의도적으로 기본값 없음.
+    ///       get("key") 형태는 2-param 오버로드를 사용할 것.
     const std::string& get(const std::string& section,
                            const std::string& key,
-                           const std::string& defaultValue = EMPTY) const
+                           const std::string& defaultValue) const
     {
-        auto secIt = m_data.find(str::to_lower(section));
+        auto secIt = m_data.find(strutil::to_lower(section));
         if (secIt == m_data.end()) return defaultValue;
-        auto keyIt = secIt->second.find(str::to_lower(key));
+        auto keyIt = secIt->second.find(strutil::to_lower(key));
         if (keyIt == secIt->second.end()) return defaultValue;
         return keyIt->second;
     }
@@ -95,7 +94,7 @@ public:
                const std::string& key,
                int defaultValue = 0) const
     {
-        return str::to_int(get(section, key, EMPTY)).value_or(defaultValue);
+        return strutil::to_int(get(section, key, EMPTY)).value_or(defaultValue);
     }
 
     int getInt(const std::string& key, int defaultValue = 0) const {
@@ -107,7 +106,7 @@ public:
                      const std::string& key,
                      double defaultValue = 0.0) const
     {
-        return str::to_double(get(section, key, EMPTY)).value_or(defaultValue);
+        return strutil::to_double(get(section, key, EMPTY)).value_or(defaultValue);
     }
 
     double getDouble(const std::string& key, double defaultValue = 0.0) const {
@@ -122,7 +121,7 @@ public:
         const auto& raw = get(section, key, EMPTY);
         if (raw.empty()) return defaultValue;
 
-        const auto lv = str::to_lower(raw);
+        const auto lv = strutil::to_lower(raw);
         if (lv == "true" || lv == "yes" || lv == "1" || lv == "on") return true;
         if (lv == "false" || lv == "no"  || lv == "0" || lv == "off") return false;
         return defaultValue;
@@ -137,7 +136,7 @@ public:
     std::vector<std::string> getList(const std::string& section,
                                      const std::string& key) const
     {
-        return str::split_comma(get(section, key, EMPTY));
+        return strutil::split_comma(get(section, key, EMPTY));
     }
 
     std::vector<std::string> getList(const std::string& key) const {
@@ -146,14 +145,14 @@ public:
 
     /// 섹션 존재 여부
     bool hasSection(const std::string& section) const {
-        return m_data.count(str::to_lower(section)) > 0;
+        return m_data.count(strutil::to_lower(section)) > 0;
     }
 
     /// 키 존재 여부
     bool hasKey(const std::string& section, const std::string& key) const {
-        auto secIt = m_data.find(str::to_lower(section));
+        auto secIt = m_data.find(strutil::to_lower(section));
         if (secIt == m_data.end()) return false;
-        return secIt->second.count(str::to_lower(key)) > 0;
+        return secIt->second.count(strutil::to_lower(key)) > 0;
     }
 
     bool hasKey(const std::string& key) const {
@@ -200,7 +199,7 @@ private:
                 line = line.substr(3);
             }
 
-            line = str::trim(line);
+            line = std::string(strutil::trim(line));
 
             // 빈 줄 / 주석 줄 건너뜀
             if (line.empty() || line[0] == '#' || line[0] == ';')
@@ -208,8 +207,8 @@ private:
 
             // 섹션 헤더 [section]
             if (line.front() == '[' && line.back() == ']') {
-                currentSection = str::to_lower(
-                    str::trim(line.substr(1, line.size() - 2)));
+                currentSection = strutil::to_lower(
+                    std::string(strutil::trim(line.substr(1, line.size() - 2))));
                 m_data[currentSection]; // 섹션 보장
                 continue;
             }
@@ -218,21 +217,22 @@ private:
             const auto eqPos = line.find('=');
             if (eqPos == std::string::npos) continue;
 
-            std::string key      = str::to_lower(str::trim(line.substr(0, eqPos)));
-            std::string rawValue = str::trim(line.substr(eqPos + 1));
+            std::string key      = strutil::to_lower(
+                std::string(strutil::trim(line.substr(0, eqPos))));
+            std::string rawValue = std::string(strutil::trim(line.substr(eqPos + 1)));
 
             // 백슬래시 줄 이음
             while (!rawValue.empty() && rawValue.back() == '\\') {
                 rawValue.pop_back();
-                rawValue = str::trim(rawValue);
+                rawValue = std::string(strutil::trim(rawValue));
                 std::string nextLine;
                 if (!std::getline(file, nextLine)) break;
-                nextLine = str::trim(nextLine);
+                nextLine = std::string(strutil::trim(nextLine));
                 if (nextLine.empty() || nextLine[0] == '#' || nextLine[0] == ';') break;
                 rawValue += " " + nextLine;
             }
 
-            std::string value = str::trim(str::strip_comment(rawValue));
+            std::string value = std::string(strutil::trim(strutil::strip_comment(rawValue)));
 
             // 따옴표 자동 제거
             if (value.size() >= 2 &&
@@ -247,26 +247,6 @@ private:
         }
 
         m_loaded = true;
-    }
-
-    // 실행파일 경로에서 확장자를 .conf 로 교체
-    static std::string executableConfPath()
-    {
-        namespace fs = std::filesystem;
-
-#ifdef _WIN32
-        wchar_t wpath[MAX_PATH] = {};
-        if (GetModuleFileNameW(nullptr, wpath, MAX_PATH) == 0) return "app.conf";
-        fs::path p(wpath);
-#else
-        char buf[PATH_MAX] = {};
-        const ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-        if (len <= 0) return "app.conf";
-        fs::path p(std::string(buf, static_cast<size_t>(len)));
-#endif
-        p.replace_extension(".conf");
-        auto u8 = p.u8string();
-        return std::string(u8.begin(), u8.end());
     }
 
     // ----------------------------------------------------------

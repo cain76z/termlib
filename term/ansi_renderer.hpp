@@ -42,8 +42,8 @@
  *
  * 구현부가 모두 클래스 본체 안에 위치한다.
  */
-#include "term_info.hpp"
-#include "ansi_optimizer.hpp"
+#include "term/term_info.hpp"
+#include "term/ansi_optimizer.hpp"
 
 namespace term {
 

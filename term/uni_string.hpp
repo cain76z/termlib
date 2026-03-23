@@ -19,8 +19,8 @@
  */
 
 #include "platform.hpp"
-#include "unicode_width_table.hpp"      // detail::kWidthBlockIndex, kWidthBlockData, kSmpWidthRanges
-#include "unicode_grapheme_table.hpp"   // detail::GBProp, kGBBlockIndex, kGBBlockData
+#include "term/unicode_width_table.hpp"      // detail::kWidthBlockIndex, kWidthBlockData, kSmpWidthRanges
+#include "term/unicode_grapheme_table.hpp"   // detail::GBProp, kGBBlockIndex, kGBBlockData
 #include <algorithm>
 #include <array>
 #include <cassert>
